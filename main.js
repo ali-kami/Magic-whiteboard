@@ -15,6 +15,18 @@ const PEN_HOLD_FRAMES = 3; // new state must hold this many frames in a row
 const PEN_COLOR = "#000";
 const PEN_WIDTH = 4; // px
 
+// --- Cursor smoothing (One Euro filter) ---
+// MIN_CUTOFF: lower = smoother when the hand is slow/still (but more lag).
+// BETA: higher = less lag when the hand moves fast (but more jitter).
+// D_CUTOFF: smoothing of the speed estimate; rarely needs changing.
+const MIN_CUTOFF = 1.0;
+const BETA = 0.007;
+const D_CUTOFF = 1.0;
+
+// Points trimmed from the start AND the end of every finished stroke, to
+// remove the tails caused by the pinch/release moving the cursor.
+const TRIM_POINTS = 3;
+
 // If the cursor moves farther than this (px) in one frame, treat it as a
 // tracking glitch: end the stroke and start a new one.
 const MAX_JUMP_PX = 150;
@@ -76,6 +88,7 @@ const distTIEl = document.getElementById("distTI");
 const distTMEl = document.getElementById("distTM");
 const cursorPosEl = document.getElementById("cursorPos");
 const modeEl = document.getElementById("mode");
+const smoothingEl = document.getElementById("smoothing");
 
 // ---------------------------------------------------------------------------
 // Messages
@@ -184,6 +197,88 @@ function clamp(value, min, max) {
   return Math.min(max, Math.max(min, value));
 }
 
+// One Euro filter: a low-pass filter whose cutoff rises with speed. Slow
+// movement gets heavy smoothing (no jitter); fast movement gets light
+// smoothing (no lag). Filters one number; we use one per axis.
+class OneEuroFilter {
+  constructor(minCutoff, beta, dCutoff) {
+    this.minCutoff = minCutoff;
+    this.beta = beta;
+    this.dCutoff = dCutoff;
+    this.reset();
+  }
+
+  reset() {
+    this.x = null; // last filtered value (null = no history yet)
+    this.dx = 0; // last filtered speed
+    this.t = 0; // time of last sample, in seconds
+  }
+
+  // How much of the new sample to let through, given a cutoff and time step
+  static alpha(cutoff, dt) {
+    const tau = 1 / (2 * Math.PI * cutoff);
+    return 1 / (1 + tau / dt);
+  }
+
+  // value: new raw sample; t: its time in seconds. Returns the smoothed value.
+  filter(value, t) {
+    if (this.x === null) {
+      this.x = value;
+      this.t = t;
+      return value;
+    }
+    const dt = t - this.t;
+    if (dt <= 0) return this.x; // same frame twice: nothing new
+
+    const speed = (value - this.x) / dt;
+    this.dx += OneEuroFilter.alpha(this.dCutoff, dt) * (speed - this.dx);
+
+    const cutoff = this.minCutoff + this.beta * Math.abs(this.dx);
+    this.x += OneEuroFilter.alpha(cutoff, dt) * (value - this.x);
+    this.t = t;
+    return this.x;
+  }
+}
+
+const cursorFilterX = new OneEuroFilter(MIN_CUTOFF, BETA, D_CUTOFF);
+const cursorFilterY = new OneEuroFilter(MIN_CUTOFF, BETA, D_CUTOFF);
+
+let smoothingOn = true; // toggled with the 's' key
+
+function resetCursorFilters() {
+  cursorFilterX.reset();
+  cursorFilterY.reset();
+}
+
+// Smooth a raw cursor { x, y } (or null). timestampMs: time of this frame.
+// When the hand disappears the filters reset, so when it comes back the cursor
+// starts at the new position instead of sliding in from the old one.
+// With smoothing off the raw cursor is returned as is.
+function smoothCursor(rawCursor, timestampMs) {
+  if (!rawCursor) {
+    resetCursorFilters();
+    return null;
+  }
+  if (!smoothingOn) return rawCursor;
+  const t = timestampMs / 1000;
+  return {
+    x: cursorFilterX.filter(rawCursor.x, t),
+    y: cursorFilterY.filter(rawCursor.y, t),
+  };
+}
+
+// Tracking-glitch detector. Call once per new camera frame with the RAW
+// cursor. Returns true if it moved more than MAX_JUMP_PX since the last frame.
+let lastRawCursor = null;
+function detectJump(rawCursor) {
+  const jumped =
+    rawCursor !== null &&
+    lastRawCursor !== null &&
+    Math.hypot(rawCursor.x - lastRawCursor.x, rawCursor.y - lastRawCursor.y) > MAX_JUMP_PX;
+  lastRawCursor = rawCursor;
+  return jumped;
+}
+
 // Draw the cursor on its own layer. Pass null to just clear it.
 //   hovering: hollow dark gray ring
 //   drawing:  solid dot in the pen color, slightly smaller
@@ -251,14 +346,53 @@ const strokes = []; // finished strokes
 let currentStroke = null; // the stroke being drawn right now, or null
 let boardDirty = true; // true when the board needs to be redrawn
 
+// Finished strokes are drawn once onto this offscreen canvas. Each frame the
+// board just copies it and draws the current stroke on top, so drawing stays
+// fast no matter how many strokes there are. The full stroke list is only
+// redrawn onto it after a resize (see rebuildCache).
+const cache = document.createElement("canvas");
+const cacheCtx = cache.getContext("2d");
+
+// Pen look; set before drawing strokes (resizing a canvas resets its settings)
+function applyPenStyle(ctx) {
+  ctx.strokeStyle = PEN_COLOR;
+  ctx.lineWidth = PEN_WIDTH;
+  ctx.lineCap = "round";
+  ctx.lineJoin = "round";
+}
+
+// Match the cache to the board's pixel size, then redraw every finished stroke
+function rebuildCache() {
+  cache.width = board.width;
+  cache.height = board.height;
+  const dpr = window.devicePixelRatio || 1;
+  cacheCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  applyPenStyle(cacheCtx);
+  for (const stroke of strokes) drawStroke(cacheCtx, stroke);
+}
+
 function startStroke(cursor) {
   currentStroke = [{ x: cursor.x, y: cursor.y }];
   boardDirty = true;
 }
 
+// Cut the tails off a finished stroke: drop TRIM_POINTS points from each end.
+// If fewer than 2 points would be left, the stroke was a tap or a tiny mark,
+// so keep it as a single dot (at its middle point) instead of losing it.
+function trimStroke(stroke) {
+  if (stroke.length - 2 * TRIM_POINTS >= 2) {
+    return stroke.slice(TRIM_POINTS, stroke.length - TRIM_POINTS);
+  }
+  return [stroke[Math.floor(stroke.length / 2)]];
+}
+
+// While a stroke is in progress all its points are drawn; trimming only
+// happens here, when it is finished.
 function endStroke() {
   if (currentStroke) {
-    strokes.push(currentStroke);
+    const finished = trimStroke(currentStroke);
+    strokes.push(finished);
+    drawStroke(cacheCtx, finished); // add it to the cache, once
     currentStroke = null;
     boardDirty = true;
   }
@@ -266,23 +400,21 @@ function endStroke() {
 
 function clearBoard() {
   strokes.length = 0;
+  cacheCtx.clearRect(0, 0, cache.width, cache.height); // (overshoots because of the dpr transform; harmless)
   currentStroke = null; // if the pen is still on, a new stroke starts next frame
   boardDirty = true;
 }
 
 // Call once per new camera frame, after updatePen().
 // Pen on -> start/extend a stroke. Pen off or hand lost -> end it.
-function updateStroke(cursor) {
+// jumped: the raw cursor made a tracking-glitch jump this frame (see
+// detectJump), so the current stroke ends and a new one starts.
+function updateStroke(cursor, jumped) {
+  if (jumped) endStroke(); // don't draw a long stray line
+
   if (!pen.on || !cursor) {
     endStroke();
     return;
-  }
-
-  if (currentStroke) {
-    const last = currentStroke[currentStroke.length - 1];
-    if (Math.hypot(cursor.x - last.x, cursor.y - last.y) > MAX_JUMP_PX) {
-      endStroke(); // tracking glitch: don't draw a long stray line
-    }
   }
 
   if (!currentStroke) {
@@ -318,18 +450,18 @@ function drawStroke(ctx, stroke) {
   ctx.stroke();
 }
 
-// Redraw the whole board (only when something changed)
+// Update the board (only when something changed): the cached finished
+// strokes, plus the stroke in progress on top.
 function drawBoard() {
   if (!boardDirty) return;
   boardDirty = false;
 
-  boardCtx.clearRect(0, 0, board.clientWidth, board.clientHeight);
-  boardCtx.strokeStyle = PEN_COLOR;
-  boardCtx.lineWidth = PEN_WIDTH;
-  boardCtx.lineCap = "round";
-  boardCtx.lineJoin = "round";
+  const w = board.clientWidth;
+  const h = board.clientHeight;
+  boardCtx.clearRect(0, 0, w, h);
+  boardCtx.drawImage(cache, 0, 0, w, h);
 
-  for (const stroke of strokes) drawStroke(boardCtx, stroke);
+  applyPenStyle(boardCtx);
   if (currentStroke) drawStroke(boardCtx, currentStroke); // show it as it grows
 }
 
@@ -350,7 +482,8 @@ function resizeCanvases() {
   fitCanvas(board);
   fitCanvas(cursorCanvas);
   fitCanvas(overlay);
-  boardDirty = true; // resizing wipes a canvas, so redraw the strokes
+  rebuildCache(); // resizing wipes a canvas, so redraw the strokes
+  boardDirty = true;
 }
 
 // Convert a landmark (0–1 in the video frame) to a position on the preview.
@@ -468,9 +601,14 @@ function startLoop(handTracker) {
     if (video.currentTime !== lastVideoTime) {
       lastVideoTime = video.currentTime;
       landmarks = detectHand(handTracker, now);
-      cursor = getCursor(landmarks);
+      const rawCursor = getCursor(landmarks);
+      // Glitches are checked on the RAW cursor: smoothing would soften a
+      // sudden jump and could let it slip under the limit
+      const jumped = detectJump(rawCursor);
+      if (jumped) resetCursorFilters(); // new position, no sliding from the old one
+      cursor = smoothCursor(rawCursor, now);
       updatePen(landmarks);
-      updateStroke(cursor);
+      updateStroke(cursor, jumped);
       frameCount++;
     }
 
@@ -499,12 +637,18 @@ async function main() {
   resizeCanvases();
   window.addEventListener("resize", resizeCanvases);
 
-  // Keys: 'c' shows/hides the camera preview, 'x' clears the board
+  // Keys: 'c' shows/hides the camera preview, 'x' clears the board,
+  // 's' turns cursor smoothing on/off
   window.addEventListener("keydown", (event) => {
     if (event.metaKey || event.ctrlKey || event.altKey) return;
     const key = event.key.toLowerCase();
     if (key === "c") preview.classList.toggle("hidden");
     if (key === "x") clearBoard();
+    if (key === "s") {
+      smoothingOn = !smoothingOn;
+      resetCursorFilters(); // start fresh so there's no jump when switching
+      smoothingEl.textContent = smoothingOn ? "on" : "off";
+    }
   });
 
   // 1. Camera

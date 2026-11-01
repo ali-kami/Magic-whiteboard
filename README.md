@@ -2,7 +2,7 @@
 
 A whiteboard you draw on with hand gestures, using a webcam and a projector.
 
-**Step 3 (this version): draw with the pen gesture.** The window is a white
+**Step 4 (this version): smoothing and clean strokes** on top of the pen gesture. The window is a white
 whiteboard, a small camera preview with your hand skeleton sits in the
 bottom-right corner, and a cursor follows the midpoint between your thumb and
 index fingertips. Pinch thumb and index together to draw; open them to hover.
@@ -35,6 +35,17 @@ is needed on first load (MediaPipe and the hand model come from a CDN).
   solid black dot, slightly smaller. The info box shows `Mode: PEN` or `Mode: HOVER`.
 - A stroke ends if the pen turns off, the hand disappears, or the cursor jumps
   more than 150px in one frame (so tracking glitches don't leave stray lines).
+- **Smoothing:** the cursor is passed through a One Euro filter (`MIN_CUTOFF`,
+  `BETA`, `D_CUTOFF` at the top of `main.js`). Lower `MIN_CUTOFF` = steadier but
+  laggier; higher `BETA` = less lag on fast moves. It resets when the hand disappears.
+- **Clean strokes:** when a stroke finishes, `TRIM_POINTS` (3) points are removed
+  from each end to cut the tails caused by pinching and releasing. Strokes too
+  short to trim become a single dot, so quick taps still work. While you are
+  still drawing, the whole line is shown, then it tightens up on release.
+- **Performance:** finished strokes are cached on an offscreen canvas; each frame
+  only copies the cache and draws the stroke in progress on top. The full list is
+  redrawn only after a window resize.
+- **Glitch protection:** the 150px jump check uses the raw (unsmoothed) cursor.
 - A cursor at the midpoint of your thumb and index tips.
   The active zone (middle 60% of the camera frame) covers the whole board, so
   reaching a zone edge puts the cursor at the matching board edge. The cursor
@@ -48,6 +59,7 @@ is needed on first load (MediaPipe and the hand model come from a CDN).
 | --- | --- |
 | `c` | Show / hide the camera preview (tracking keeps running while hidden) |
 | `x` | Clear the board |
+| `s` | Turn cursor smoothing on / off (shown in the info box) |
 
 If the camera is denied or MediaPipe can't load, a red error message appears
 instead of a blank page.
@@ -63,5 +75,6 @@ instead of a blank page.
 In `main.js`: hand tracking is `createHandTracker()`, `startCamera()`,
 `detectHand()` and the distance helpers; the cursor is `getCursor()` and
 `drawCursor()`; the pen is `updatePen()`; strokes are `updateStroke()`,
-`drawStroke()` and `drawBoard()`. The whiteboard (`#board`) and the cursor
+`trimStroke()`, `detectJump()`, `drawStroke()`, `rebuildCache()` and `drawBoard()`; smoothing is `OneEuroFilter` and
+`smoothCursor()`. The whiteboard (`#board`) and the cursor
 (`#cursor`) are separate canvases so strokes aren't erased when the cursor moves.
