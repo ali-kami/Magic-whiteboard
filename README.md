@@ -2,36 +2,52 @@
 
 A whiteboard you draw on with hand gestures, using a webcam and a projector.
 
-**Step 1 (this version): hand tracking only.** No drawing yet. It shows your
-webcam, overlays your hand skeleton, and highlights the thumb, index and
-middle fingertips.
+**Step 3 (this version): draw with the pen gesture.** The window is a white
+whiteboard, a small camera preview with your hand skeleton sits in the
+bottom-right corner, and a cursor follows the midpoint between your thumb and
+index fingertips. Pinch thumb and index together to draw; open them to hover.
 
 ## Run it
 
-You need [Node.js](https://nodejs.org) (for `npx`) and a webcam. The camera only
-works on `localhost` or HTTPS, so open the page through a local server rather
-than double-clicking `index.html`.
+You need Python 3 and a webcam. The camera only works on `localhost` or HTTPS,
+so open the page through a local server rather than double-clicking `index.html`.
 
 ```bash
 cd Magic-whiteboard
-npx serve
+python3 -m http.server 8000
 ```
 
-Then open the address it prints (usually <http://localhost:3000>) in Chrome or
-Edge and click **Allow** when asked for camera access. An internet connection
+Then open <http://localhost:8000> in Chrome or Edge and click **Allow** when
+asked for camera access. An internet connection
 is needed on first load (MediaPipe and the hand model come from a CDN).
 
 ## What you should see
 
-- Your webcam feed filling the window, mirrored (move your hand right → it moves right on screen).
-- A white hand skeleton with 21 yellow dots when your hand is in view.
-- Three big fingertip dots: **T** red (thumb), **I** blue (index), **M** green (middle).
-- An info box in the top-left: FPS, whether a hand is detected, and the
-  thumb–index and thumb–middle distances.
+- A full-window white whiteboard.
+- A small mirrored camera preview (about 25% of the window width) in the bottom-right,
+  with the hand skeleton and the red **T**, blue **I**, green **M** fingertips.
+- A faint dashed rectangle on the preview: the **active zone**. Keep your hand inside it.
+- **Pen gesture:** pinch thumb and index to draw a black 4px line. The pen turns
+  ON when the normalized thumb–index distance drops below `0.25` and OFF when it
+  rises above `0.35`, and a change must hold for 3 camera frames. Tune these with
+  the constants at the top of `main.js`. The middle finger is ignored for now.
+- While hovering the cursor is a hollow dark gray ring; while drawing it becomes a
+  solid black dot, slightly smaller. The info box shows `Mode: PEN` or `Mode: HOVER`.
+- A stroke ends if the pen turns off, the hand disappears, or the cursor jumps
+  more than 150px in one frame (so tracking glitches don't leave stray lines).
+- A cursor at the midpoint of your thumb and index tips.
+  The active zone (middle 60% of the camera frame) covers the whole board, so
+  reaching a zone edge puts the cursor at the matching board edge. The cursor
+  never leaves the screen and disappears when no hand is detected.
+- An info box (top-left): FPS, hand detected, thumb–index and thumb–middle
+  distances (divided by hand size), and the cursor's x, y on the board in pixels.
 
-The distances are divided by hand size (wrist to middle knuckle), so `1.00`
-means "one hand-size apart". Pinching thumb and index together should give
-a value near `0.00`.
+## Keys
+
+| Key | Action |
+| --- | --- |
+| `c` | Show / hide the camera preview (tracking keeps running while hidden) |
+| `x` | Clear the board |
 
 If the camera is denied or MediaPipe can't load, a red error message appears
 instead of a blank page.
@@ -40,9 +56,12 @@ instead of a blank page.
 
 | File | Purpose |
 | --- | --- |
-| `index.html` | Page structure: video, canvas, info box, message |
-| `style.css` | Full-window layout, mirrored video, info box styling |
-| `main.js` | Camera, hand tracking, drawing, info box |
+| `index.html` | Page structure: board, cursor layer, preview, info box, message |
+| `style.css` | Layout and styling |
+| `main.js` | Camera, hand tracking, cursor, pen gesture, strokes, preview, info box |
 
-Hand tracking lives in `createHandTracker()`, `startCamera()`, `detectHand()`
-and the distance helpers in `main.js`, so later steps can build on them.
+In `main.js`: hand tracking is `createHandTracker()`, `startCamera()`,
+`detectHand()` and the distance helpers; the cursor is `getCursor()` and
+`drawCursor()`; the pen is `updatePen()`; strokes are `updateStroke()`,
+`drawStroke()` and `drawBoard()`. The whiteboard (`#board`) and the cursor
+(`#cursor`) are separate canvases so strokes aren't erased when the cursor moves.

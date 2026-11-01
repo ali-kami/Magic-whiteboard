@@ -1,9 +1,23 @@
-// MagicBoard – step 1: hand tracking only.
-// Pipeline: webcam -> MediaPipe HandLandmarker -> draw skeleton + info box.
+// MagicBoard – step 3: draw with the pen gesture (pinch thumb and index).
+// Pipeline: webcam -> MediaPipe HandLandmarker -> cursor + pen state ->
+// strokes on the whiteboard, plus a small camera preview with the skeleton.
 
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
+
+// --- Pen gesture tuning (normalized thumb–index distance; 1.0 = hand size) ---
+const PEN_ON_THRESHOLD = 0.25; // pinch tighter than this -> pen turns ON
+const PEN_OFF_THRESHOLD = 0.35; // open wider than this -> pen turns OFF
+const PEN_HOLD_FRAMES = 3; // new state must hold this many frames in a row
+
+// --- Pen look ---
+const PEN_COLOR = "#000";
+const PEN_WIDTH = 4; // px
+
+// If the cursor moves farther than this (px) in one frame, treat it as a
+// tracking glitch: end the stroke and start a new one.
+const MAX_JUMP_PX = 150;
 
 const MEDIAPIPE_VERSION = "0.10.14";
 const MEDIAPIPE_URL = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MEDIAPIPE_VERSION}`;
@@ -34,19 +48,34 @@ const HIGHLIGHTS = [
   { index: MIDDLE_TIP, color: "limegreen", label: "M" },
 ];
 
+// The "active zone": the centered part of the camera frame that maps to the
+// whole whiteboard. 0.6 = the middle 60% of the width and of the height.
+const ACTIVE_ZONE = 0.6;
+
+const CURSOR_DIAMETER = 20; // px, hollow ring while hovering
+const PEN_DOT_DIAMETER = 16; // px, solid dot while drawing (slightly smaller)
+const CURSOR_COLOR = "#444"; // dark gray
+
 // ---------------------------------------------------------------------------
 // Page elements
 // ---------------------------------------------------------------------------
 
 const video = document.getElementById("video");
-const canvas = document.getElementById("overlay");
-const ctx = canvas.getContext("2d");
+const preview = document.getElementById("preview");
+const overlay = document.getElementById("overlay"); // skeleton, on the preview
+const overlayCtx = overlay.getContext("2d");
+const board = document.getElementById("board"); // whiteboard: strokes are drawn here
+const boardCtx = board.getContext("2d");
+const cursorCanvas = document.getElementById("cursor");
+const cursorCtx = cursorCanvas.getContext("2d");
 const messageEl = document.getElementById("message");
 const infoEl = document.getElementById("info");
 const fpsEl = document.getElementById("fps");
 const handEl = document.getElementById("hand");
 const distTIEl = document.getElementById("distTI");
 const distTMEl = document.getElementById("distTM");
+const cursorPosEl = document.getElementById("cursorPos");
+const modeEl = document.getElementById("mode");
 
 // ---------------------------------------------------------------------------
 // Messages
@@ -89,6 +118,9 @@ async function startCamera() {
   });
   video.srcObject = stream;
   await video.play();
+
+  // Make the preview box the same shape as the webcam image
+  preview.style.aspectRatio = `${video.videoWidth} / ${video.videoHeight}`;
 }
 
 // Run the model on the current video frame.
@@ -121,38 +153,235 @@ function normalizedDistance(landmarks, i, j) {
 }
 
 // ---------------------------------------------------------------------------
-// Drawing
+// Cursor
 // ---------------------------------------------------------------------------
 
-// Match the canvas to the window size (and screen sharpness).
-function resizeCanvas() {
-  const dpr = window.devicePixelRatio || 1;
-  canvas.width = window.innerWidth * dpr;
-  canvas.height = window.innerHeight * dpr;
-  ctx.setTransform(dpr, 0, 0, dpr, 0, 0); // draw in CSS pixels from now on
-}
+// Where the cursor is on the whiteboard, in CSS pixels: { x, y }.
+// Returns null when no hand is visible.
+//
+// 1. Take the midpoint of thumb tip and index tip.
+// 2. Mirror x (so moving your hand right moves the cursor right).
+// 3. Stretch the active zone (middle 60% of the camera frame) over the whole
+//    board, so you never need to reach the edges of the camera view.
+// 4. Clamp so the cursor stays on screen.
+function getCursor(landmarks) {
+  if (!landmarks) return null;
 
-// Convert a landmark (0–1 in the video frame) to a canvas position.
-// Mirrors x to match the mirrored video, and applies the same "cover"
-// scaling + centering that CSS object-fit: cover uses on the video.
-function toScreen(landmark) {
-  const vw = video.videoWidth;
-  const vh = video.videoHeight;
-  const scale = Math.max(window.innerWidth / vw, window.innerHeight / vh);
-  const offsetX = (window.innerWidth - vw * scale) / 2;
-  const offsetY = (window.innerHeight - vh * scale) / 2;
+  const midX = (landmarks[THUMB_TIP].x + landmarks[INDEX_TIP].x) / 2;
+  const midY = (landmarks[THUMB_TIP].y + landmarks[INDEX_TIP].y) / 2;
+
+  const zoneStart = (1 - ACTIVE_ZONE) / 2; // 0.2
+  const u = (1 - midX - zoneStart) / ACTIVE_ZONE; // 0 = left edge of zone, 1 = right
+  const v = (midY - zoneStart) / ACTIVE_ZONE; // 0 = top edge of zone, 1 = bottom
+
   return {
-    x: offsetX + (1 - landmark.x) * vw * scale, // (1 - x) = mirror
-    y: offsetY + landmark.y * vh * scale,
+    x: clamp(u, 0, 1) * board.clientWidth,
+    y: clamp(v, 0, 1) * board.clientHeight,
   };
 }
 
+function clamp(value, min, max) {
+  return Math.min(max, Math.max(min, value));
+}
+
+// Draw the cursor on its own layer. Pass null to just clear it.
+//   hovering: hollow dark gray ring
+//   drawing:  solid dot in the pen color, slightly smaller
+function drawCursor(cursor, penOn) {
+  cursorCtx.clearRect(0, 0, cursorCanvas.clientWidth, cursorCanvas.clientHeight);
+  if (!cursor) return;
+
+  if (penOn) {
+    cursorCtx.fillStyle = PEN_COLOR;
+    cursorCtx.beginPath();
+    cursorCtx.arc(cursor.x, cursor.y, PEN_DOT_DIAMETER / 2, 0, Math.PI * 2);
+    cursorCtx.fill();
+    return;
+  }
+
+  const lineWidth = 2;
+  cursorCtx.strokeStyle = CURSOR_COLOR;
+  cursorCtx.lineWidth = lineWidth;
+  cursorCtx.beginPath();
+  // Subtract half the line width so the outer edge is exactly CURSOR_DIAMETER
+  cursorCtx.arc(cursor.x, cursor.y, CURSOR_DIAMETER / 2 - lineWidth / 2, 0, Math.PI * 2);
+  cursorCtx.stroke();
+}
+
+// ---------------------------------------------------------------------------
+// Pen gesture
+// ---------------------------------------------------------------------------
+
+const pen = {
+  on: false, // current (debounced) pen state
+  framesInOtherState: 0, // how many frames in a row want to switch it
+};
+
+// Call once per new camera frame. Updates pen.on from the pinch distance.
+//
+// Hysteresis: turning ON needs a tighter pinch than staying on, so a distance
+// hovering around one number can't flicker. Between the two thresholds the pen
+// keeps whatever state it has. A switch also has to be wanted for
+// PEN_HOLD_FRAMES frames in a row.
+function updatePen(landmarks) {
+  if (!landmarks) {
+    // No hand: pen is off immediately
+    pen.on = false;
+    pen.framesInOtherState = 0;
+    return;
+  }
+
+  const distance = normalizedDistance(landmarks, THUMB_TIP, INDEX_TIP);
+  const wantsOn = pen.on ? distance <= PEN_OFF_THRESHOLD : distance < PEN_ON_THRESHOLD;
+
+  if (wantsOn === pen.on) {
+    pen.framesInOtherState = 0;
+  } else if (++pen.framesInOtherState >= PEN_HOLD_FRAMES) {
+    pen.on = wantsOn;
+    pen.framesInOtherState = 0;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Strokes and the whiteboard
+// ---------------------------------------------------------------------------
+
+// A stroke is an array of points: [{ x, y }, ...] in board pixels.
+const strokes = []; // finished strokes
+let currentStroke = null; // the stroke being drawn right now, or null
+let boardDirty = true; // true when the board needs to be redrawn
+
+function startStroke(cursor) {
+  currentStroke = [{ x: cursor.x, y: cursor.y }];
+  boardDirty = true;
+}
+
+function endStroke() {
+  if (currentStroke) {
+    strokes.push(currentStroke);
+    currentStroke = null;
+    boardDirty = true;
+  }
+}
+
+function clearBoard() {
+  strokes.length = 0;
+  currentStroke = null; // if the pen is still on, a new stroke starts next frame
+  boardDirty = true;
+}
+
+// Call once per new camera frame, after updatePen().
+// Pen on -> start/extend a stroke. Pen off or hand lost -> end it.
+function updateStroke(cursor) {
+  if (!pen.on || !cursor) {
+    endStroke();
+    return;
+  }
+
+  if (currentStroke) {
+    const last = currentStroke[currentStroke.length - 1];
+    if (Math.hypot(cursor.x - last.x, cursor.y - last.y) > MAX_JUMP_PX) {
+      endStroke(); // tracking glitch: don't draw a long stray line
+    }
+  }
+
+  if (!currentStroke) {
+    startStroke(cursor);
+  } else {
+    currentStroke.push({ x: cursor.x, y: cursor.y });
+    boardDirty = true;
+  }
+}
+
+// Trace one stroke as a smooth line. Each point acts as a control point of a
+// quadratic curve that ends at the midpoint to the next point, which rounds
+// off the corners between samples.
+function drawStroke(ctx, stroke) {
+  if (stroke.length === 1) {
+    // A single tap: just a dot
+    ctx.fillStyle = PEN_COLOR;
+    ctx.beginPath();
+    ctx.arc(stroke[0].x, stroke[0].y, PEN_WIDTH / 2, 0, Math.PI * 2);
+    ctx.fill();
+    return;
+  }
+
+  ctx.beginPath();
+  ctx.moveTo(stroke[0].x, stroke[0].y);
+  for (let i = 1; i < stroke.length - 1; i++) {
+    const midX = (stroke[i].x + stroke[i + 1].x) / 2;
+    const midY = (stroke[i].y + stroke[i + 1].y) / 2;
+    ctx.quadraticCurveTo(stroke[i].x, stroke[i].y, midX, midY);
+  }
+  const end = stroke[stroke.length - 1];
+  ctx.lineTo(end.x, end.y);
+  ctx.stroke();
+}
+
+// Redraw the whole board (only when something changed)
+function drawBoard() {
+  if (!boardDirty) return;
+  boardDirty = false;
+
+  boardCtx.clearRect(0, 0, board.clientWidth, board.clientHeight);
+  boardCtx.strokeStyle = PEN_COLOR;
+  boardCtx.lineWidth = PEN_WIDTH;
+  boardCtx.lineCap = "round";
+  boardCtx.lineJoin = "round";
+
+  for (const stroke of strokes) drawStroke(boardCtx, stroke);
+  if (currentStroke) drawStroke(boardCtx, currentStroke); // show it as it grows
+}
+
+// ---------------------------------------------------------------------------
+// Camera preview drawing
+// ---------------------------------------------------------------------------
+
+// Match a canvas's pixel size to its on-screen size (and screen sharpness),
+// so we can draw in CSS pixels.
+function fitCanvas(canvas) {
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = canvas.clientWidth * dpr;
+  canvas.height = canvas.clientHeight * dpr;
+  canvas.getContext("2d").setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+
+function resizeCanvases() {
+  fitCanvas(board);
+  fitCanvas(cursorCanvas);
+  fitCanvas(overlay);
+  boardDirty = true; // resizing wipes a canvas, so redraw the strokes
+}
+
+// Convert a landmark (0–1 in the video frame) to a position on the preview.
+// The preview box has the same shape as the video, so this is just a scale,
+// plus flipping x to match the mirrored video.
+function toPreview(landmark) {
+  return {
+    x: (1 - landmark.x) * overlay.clientWidth,
+    y: landmark.y * overlay.clientHeight,
+  };
+}
+
+// Faint rectangle showing the active zone, so you know where to keep your hand
+function drawActiveZone() {
+  const w = overlay.clientWidth;
+  const h = overlay.clientHeight;
+  const margin = (1 - ACTIVE_ZONE) / 2;
+  overlayCtx.strokeStyle = "rgba(255, 255, 255, 0.55)";
+  overlayCtx.lineWidth = 1.5;
+  overlayCtx.setLineDash([6, 4]);
+  overlayCtx.strokeRect(w * margin, h * margin, w * ACTIVE_ZONE, h * ACTIVE_ZONE);
+  overlayCtx.setLineDash([]);
+}
+
 function drawHand(landmarks) {
-  const points = landmarks.map(toScreen);
+  const ctx = overlayCtx;
+  const points = landmarks.map(toPreview);
 
   // Connecting lines
   ctx.strokeStyle = "rgba(255, 255, 255, 0.85)";
-  ctx.lineWidth = 3;
+  ctx.lineWidth = 2;
   ctx.beginPath();
   for (const [a, b] of CONNECTIONS) {
     ctx.moveTo(points[a].x, points[a].y);
@@ -164,43 +393,58 @@ function drawHand(landmarks) {
   ctx.fillStyle = "yellow";
   for (const p of points) {
     ctx.beginPath();
-    ctx.arc(p.x, p.y, 5, 0, Math.PI * 2);
+    ctx.arc(p.x, p.y, 3, 0, Math.PI * 2);
     ctx.fill();
   }
 
-  // Big colored fingertips with labels
-  ctx.font = "bold 16px system-ui, sans-serif";
+  // Bigger colored fingertips with labels
+  ctx.font = "bold 12px system-ui, sans-serif";
   ctx.textAlign = "left";
   ctx.textBaseline = "middle";
   for (const { index, color, label } of HIGHLIGHTS) {
     const p = points[index];
     ctx.fillStyle = color;
     ctx.strokeStyle = "white";
-    ctx.lineWidth = 2;
+    ctx.lineWidth = 1.5;
     ctx.beginPath();
-    ctx.arc(p.x, p.y, 12, 0, Math.PI * 2);
+    ctx.arc(p.x, p.y, 7, 0, Math.PI * 2);
     ctx.fill();
     ctx.stroke();
 
     // Label with a dark outline so it's readable on any background
-    ctx.lineWidth = 4;
+    ctx.lineWidth = 3;
     ctx.strokeStyle = "black";
-    ctx.strokeText(label, p.x + 18, p.y);
+    ctx.strokeText(label, p.x + 11, p.y);
     ctx.fillStyle = "white";
-    ctx.fillText(label, p.x + 18, p.y);
+    ctx.fillText(label, p.x + 11, p.y);
   }
 }
 
-function updateInfoBox(fps, landmarks) {
+// Redraw the whole preview overlay: active zone, then the hand if there is one
+function drawPreviewOverlay(landmarks) {
+  overlayCtx.clearRect(0, 0, overlay.clientWidth, overlay.clientHeight);
+  drawActiveZone();
+  if (landmarks) drawHand(landmarks);
+}
+
+// ---------------------------------------------------------------------------
+// Info box
+// ---------------------------------------------------------------------------
+
+function updateInfoBox(fps, landmarks, cursor) {
   fpsEl.textContent = fps;
   if (landmarks) {
     handEl.textContent = "yes";
     distTIEl.textContent = normalizedDistance(landmarks, THUMB_TIP, INDEX_TIP).toFixed(2);
     distTMEl.textContent = normalizedDistance(landmarks, THUMB_TIP, MIDDLE_TIP).toFixed(2);
+    cursorPosEl.textContent = `${Math.round(cursor.x)}, ${Math.round(cursor.y)}`;
+    modeEl.textContent = pen.on ? "PEN" : "HOVER";
   } else {
     handEl.textContent = "no";
     distTIEl.textContent = "–";
     distTMEl.textContent = "–";
+    cursorPosEl.textContent = "–";
+    modeEl.textContent = "–";
   }
 }
 
@@ -214,14 +458,19 @@ function startLoop(handTracker) {
   let fps = 0;
   let fpsWindowStart = performance.now();
   let landmarks = null;
+  let cursor = null;
 
   function tick() {
     const now = performance.now();
 
-    // Only run the model when the webcam has produced a new frame
+    // Only run the model (and the pen/stroke logic) when the webcam has
+    // produced a new frame, so "3 frames in a row" means 3 camera frames
     if (video.currentTime !== lastVideoTime) {
       lastVideoTime = video.currentTime;
       landmarks = detectHand(handTracker, now);
+      cursor = getCursor(landmarks);
+      updatePen(landmarks);
+      updateStroke(cursor);
       frameCount++;
     }
 
@@ -232,9 +481,10 @@ function startLoop(handTracker) {
       fpsWindowStart = now;
     }
 
-    ctx.clearRect(0, 0, window.innerWidth, window.innerHeight);
-    if (landmarks) drawHand(landmarks);
-    updateInfoBox(fps, landmarks);
+    drawBoard();
+    drawCursor(cursor, pen.on);
+    if (!preview.classList.contains("hidden")) drawPreviewOverlay(landmarks);
+    updateInfoBox(fps, landmarks, cursor);
 
     requestAnimationFrame(tick);
   }
@@ -246,13 +496,22 @@ function startLoop(handTracker) {
 // ---------------------------------------------------------------------------
 
 async function main() {
-  resizeCanvas();
-  window.addEventListener("resize", resizeCanvas);
+  resizeCanvases();
+  window.addEventListener("resize", resizeCanvases);
+
+  // Keys: 'c' shows/hides the camera preview, 'x' clears the board
+  window.addEventListener("keydown", (event) => {
+    if (event.metaKey || event.ctrlKey || event.altKey) return;
+    const key = event.key.toLowerCase();
+    if (key === "c") preview.classList.toggle("hidden");
+    if (key === "x") clearBoard();
+  });
 
   // 1. Camera
   showMessage("Requesting camera access…");
   try {
     await startCamera();
+    resizeCanvases(); // preview shape may have changed
   } catch (err) {
     console.error(err);
     const denied = err.name === "NotAllowedError" || err.name === "SecurityError";

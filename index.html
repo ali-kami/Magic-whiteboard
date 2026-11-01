@@ -7,11 +7,18 @@
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
-  <!-- Live webcam feed (mirrored with CSS) -->
-  <video id="video" autoplay playsinline muted></video>
+  <!-- The whiteboard: full-window white canvas. Strokes are drawn here. -->
+  <canvas id="board"></canvas>
 
-  <!-- Hand skeleton is drawn here, on top of the video -->
-  <canvas id="overlay"></canvas>
+  <!-- Cursor layer on top of the board (kept separate so the board's
+       drawing is never wiped when the cursor moves) -->
+  <canvas id="cursor"></canvas>
+
+  <!-- Small camera preview, bottom-right. Press 'c' to show/hide. -->
+  <div id="preview">
+    <video id="video" autoplay playsinline muted></video>
+    <canvas id="overlay"></canvas>
+  </div>
 
   <!-- Info box, top-left -->
   <div id="info" hidden>
@@ -19,6 +26,8 @@
     <div>Hand detected: <span id="hand">no</span></div>
     <div>Thumb–Index: <span id="distTI">–</span></div>
     <div>Thumb–Middle: <span id="distTM">–</span></div>
+    <div>Cursor: <span id="cursorPos">–</span></div>
+    <div>Mode: <span id="mode">–</span></div>
   </div>
 
   <!-- Status / error message, centered on screen -->

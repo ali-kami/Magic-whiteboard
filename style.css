@@ -8,29 +8,63 @@ body {
   width: 100%;
   height: 100%;
   overflow: hidden;
-  background: #000;
+  background: #fff;
   font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
 }
 
-/* Video and canvas both fill the whole window and sit on top of each other */
-#video,
-#overlay {
+/* Whiteboard and cursor layers fill the whole window, stacked */
+#board,
+#cursor {
   position: fixed;
   inset: 0;
   width: 100%;
   height: 100%;
 }
 
-/* "cover" fills the window (cropping edges if aspect ratios differ).
-   scaleX(-1) mirrors the video like a selfie. main.js uses the same
-   cover + mirror maths when drawing landmarks, so they line up. */
+#board {
+  background: #fff;
+}
+
+#cursor {
+  pointer-events: none;
+}
+
+/* Camera preview, bottom-right, about 25% of the window width.
+   main.js sets its aspect-ratio to match the webcam, so the video fills
+   the box exactly with no cropping (which keeps landmark maths simple). */
+#preview {
+  position: fixed;
+  right: 12px;
+  bottom: 12px;
+  width: 25vw;
+  aspect-ratio: 16 / 9;
+  background: #000;
+  border-radius: 8px;
+  overflow: hidden;
+  box-shadow: 0 0 0 2px rgba(0, 0, 0, 0.5), 0 4px 16px rgba(0, 0, 0, 0.3);
+}
+
+/* Toggled with the 'c' key. visibility (not display:none) so the video
+   keeps playing and tracking keeps working while the preview is hidden. */
+#preview.hidden {
+  visibility: hidden;
+}
+
+#video,
+#overlay {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+}
+
+/* scaleX(-1) mirrors the video like a selfie. The overlay canvas is NOT
+   mirrored by CSS (that would flip the text labels); main.js flips the
+   x coordinates itself instead. */
 #video {
-  object-fit: cover;
   transform: scaleX(-1);
 }
 
-/* The canvas is NOT mirrored by CSS (that would flip the text labels).
-   main.js flips the x coordinates itself instead. */
 #overlay {
   pointer-events: none;
 }
