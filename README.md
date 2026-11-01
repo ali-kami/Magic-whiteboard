@@ -2,7 +2,7 @@
 
 A whiteboard you draw on with hand gestures, using a webcam and a projector.
 
-**Step 8 (this version): steadier writing** on top of the highlighter gesture, presentation mode, pen thickness, smoothing, clean strokes and the pen gesture. The window is a white
+**Step 9 (this version): eraser and clear-all gestures** on top of steadier writing, the highlighter gesture, presentation mode, pen thickness, smoothing, clean strokes and the pen gesture. The window is a white
 whiteboard, a small camera preview with your hand skeleton sits in the
 bottom-right corner, and a cursor follows the midpoint between your thumb and
 index fingertips. Pinch thumb and index together to draw; open them to hover.
@@ -36,6 +36,20 @@ is needed on first load (MediaPipe and the hand model come from a CDN).
     yellow highlighter at 35% opacity, 3x the current thickness, as one path so it
     doesn't darken where it crosses itself.
   All thresholds are constants at the top of `main.js`.
+- **Eraser (open palm):** all 5 fingers extended (tip farther from the wrist than the
+  middle joint) and spread wide (index tip to pinky tip, in hand sizes, at least
+  `ERASER_SPREAD_THRESHOLD`). Hold it for `ERASER_HOLD_MS` (400 ms); a red ring fills
+  up around the cursor while you wait. It can only start from HOVER, never in the
+  middle of a pen or highlighter stroke. While erasing (`Mode: ERASE`) a red circle
+  of `ERASER_RADIUS` (40 px) removes whatever is inside it, and strokes are split
+  where it cuts them. Spread and fist values are shown in the info box.
+- **Clear all (double fist pump):** open hand, fist, open, fist within
+  `PUMP_WINDOW_MS` (1.5 s) clears the board and shows "Cleared. Press z to undo" for
+  `CLEAR_MESSAGE_MS`. A fist = all four fingertips within `FIST_CURL_THRESHOLD` of the
+  palm center. While a pump is under way the eraser can't start, and a fist never
+  draws, so neither the open-hand moments nor the fist cause side effects.
+- **Undo (`z`)** steps back through strokes, whole erases (one continuous erase is one
+  action) and clears, up to `UNDO_LIMIT` actions.
 - Your index usually lands first on a 3-finger pinch, so PEN may start for a few
   frames before HIGHLIGHT. On a direct PEN <-> HIGHLIGHT switch the current stroke
   ends, and if it has fewer than `SHORT_STROKE_POINTS` (10) points it is deleted, so
@@ -112,9 +126,9 @@ raise `CLEANUP_PASSES` to 2, or lower `ACTIVE_ZONE` (e.g. 0.7).
 | `c` | Show / hide the camera preview (tracking keeps running while hidden) |
 | `h` | Hide / show the info box and camera preview together (the cursor stays) |
 | `b` | Toggle board color: black board + white ink (default) / white board + black ink. Existing strokes change color too |
-| `z` | Undo the last finished stroke |
+| `z` | Undo the last action: a stroke, a whole erase, or a clear |
 | `f` | Toggle fullscreen |
-| `x` | Clear the board |
+| `x` | Clear the board (undoable with `z`) |
 | `s` | Turn cursor smoothing on / off (shown in the info box) |
 | `v` | Turn the stabilizer on / off (shown in the info box) |
 
@@ -132,6 +146,6 @@ instead of a blank page.
 In `main.js`: hand tracking is `createHandTracker()`, `startCamera()`,
 `detectHand()` and the distance helpers; the cursor is `getCursor()` and
 `drawCursor()`; the gesture mode is `updateMode()`; strokes are `updateStroke()`,
-`trimStroke()`, `detectJump()`, `strokePoint()`, `smoothStroke()`, `handDepthSize()`, `updateThickness()`, `drawStroke()`, `rebuildCache()` and `drawBoard()`; smoothing is `OneEuroFilter` and
+`trimStroke()`, `detectJump()`, `updatePose()`, `updatePump()`, `clipStroke()`, `updateEraser()`, `undo()`, `strokePoint()`, `smoothStroke()`, `handDepthSize()`, `updateThickness()`, `drawStroke()`, `rebuildCache()` and `drawBoard()`; smoothing is `OneEuroFilter` and
 `smoothCursor()`. The whiteboard (`#board`) and the cursor
 (`#cursor`) are separate canvases so strokes aren't erased when the cursor moves.

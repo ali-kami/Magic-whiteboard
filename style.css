@@ -131,3 +131,25 @@ body.ui-hidden #preview {
 #message[hidden] {
   display: none;
 }
+
+/* Big temporary message ("Cleared. Press z to undo") */
+#toast {
+  position: fixed;
+  top: 18%;
+  left: 50%;
+  transform: translateX(-50%);
+  max-width: 90vw;
+  padding: 20px 36px;
+  background: rgba(0, 0, 0, 0.85);
+  color: #fff;
+  font-size: clamp(28px, 5vw, 64px);
+  font-weight: 600;
+  text-align: center;
+  border-radius: 16px;
+  border: 2px solid rgba(255, 255, 255, 0.4);
+  pointer-events: none;
+}
+
+#toast[hidden] {
+  display: none;
+}

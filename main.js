@@ -1,4 +1,4 @@
-// MagicBoard – step 8: steadier writing (stabilizer, bigger active zone).
+// MagicBoard – step 9: eraser (open palm) and clear-all (double fist pump).
 // Pipeline: webcam -> MediaPipe HandLandmarker -> cursor + gesture mode + hand
 // size (depth) -> strokes on the whiteboard, plus a small camera preview with
 // the skeleton. Keys: c h b z x s f (see the cheat sheet in the info box).
@@ -16,6 +16,26 @@ const PEN_OFF_THRESHOLD = 0.35; // thumb-index above this -> not touching
 const HL_ON_THRESHOLD = 0.25; // thumb-middle below this -> touching
 const HL_OFF_THRESHOLD = 0.35; // thumb-middle above this -> not touching
 const MODE_HOLD_FRAMES = 3; // a new mode must hold this many frames in a row
+
+// --- Eraser (open palm: all 5 fingers extended and spread wide) ---
+const ERASER_HOLD_MS = 400; // hold the pose this long before erasing starts
+const ERASER_RADIUS = 40; // px
+// Spread = normalized distance between index tip and pinky tip (watch the
+// "Spread" line in the info box). It has to reach THRESHOLD to start erasing
+// and only has to stay above RELEASE to keep erasing (so it doesn't flicker).
+const ERASER_SPREAD_THRESHOLD = 1.2;
+const ERASER_SPREAD_RELEASE = 1.05;
+const ERASER_COLOR = "#ff3b30";
+
+// --- Clear all (double fist pump: open, fist, open, fist) ---
+// Fist = all four fingertips this close to the palm center, in hand sizes
+// (watch the "Fist" line in the info box; lower = tighter fist needed).
+const FIST_CURL_THRESHOLD = 0.75;
+const PUMP_WINDOW_MS = 1500; // open-fist-open-fist must finish within this
+const POSE_HOLD_FRAMES = 2; // an open/fist pose must hold this many frames to count
+const CLEAR_MESSAGE_MS = 2000; // how long "Cleared. Press z to undo" shows
+
+const UNDO_LIMIT = 200; // how many actions 'z' can step back through
 
 // A stroke cut short by a direct PEN <-> HIGHLIGHT switch is deleted if it has
 // fewer than this many points (the stray mark made while the fingers settle)
@@ -96,10 +116,12 @@ const MODEL_URL =
 
 // Landmark indices (MediaPipe numbers the 21 hand points 0–20)
 const WRIST = 0;
+const THUMB_IP = 3; // the thumb's middle joint
 const THUMB_TIP = 4;
 const INDEX_TIP = 8;
 const MIDDLE_KNUCKLE = 9; // base of the middle finger
 const MIDDLE_TIP = 12;
+const PINKY_TIP = 20;
 
 // Which pairs of landmarks to connect with lines
 const CONNECTIONS = [
@@ -150,6 +172,9 @@ const distTMEl = document.getElementById("distTM");
 const cursorPosEl = document.getElementById("cursorPos");
 const modeEl = document.getElementById("mode");
 const smoothingEl = document.getElementById("smoothing");
+const spreadEl = document.getElementById("spread");
+const fistEl = document.getElementById("fist");
+const toastEl = document.getElementById("toast");
 const stabilizerEl = document.getElementById("stabilizer");
 const cameraEl = document.getElementById("camera");
 const handSizeEl = document.getElementById("handSize");
@@ -441,13 +466,29 @@ function detectJump(rawCursor) {
 //   hovering:  hollow ring, as wide as the pen thickness (at least CURSOR_MIN_SIZE)
 //   pen:       solid dot in the ink color, as wide as the stroke
 //   highlight: solid yellow dot, as wide as the (3x) highlighter stroke
+//   erase:     red circle of ERASER_RADIUS
+// While waiting to erase (eraseProgress 0..1) a red ring fills up around the ring.
 // While drawing with the stabilizer on, drawingPoint ({x, y}) is shown as a
 // small dot joined to the cursor by a faint line.
-function drawCursor(cursor, mode, penThickness, drawingPoint) {
+function drawCursor(cursor, mode, penThickness, drawingPoint, eraseProgress) {
   cursorCtx.clearRect(0, 0, cursorCanvas.clientWidth, cursorCanvas.clientHeight);
   if (!cursor) return;
 
-  if (mode !== MODE_HOVER) {
+  if (mode === MODE_ERASE) {
+    // Red circle: everything inside it is erased
+    cursorCtx.fillStyle = ERASER_COLOR;
+    cursorCtx.globalAlpha = 0.15;
+    cursorCtx.beginPath();
+    cursorCtx.arc(cursor.x, cursor.y, ERASER_RADIUS, 0, Math.PI * 2);
+    cursorCtx.fill();
+    cursorCtx.globalAlpha = 1;
+    cursorCtx.strokeStyle = ERASER_COLOR;
+    cursorCtx.lineWidth = 3;
+    cursorCtx.stroke();
+    return;
+  }
+
+  if (mode === MODE_PEN || mode === MODE_HIGHLIGHT) {
     // Stabilizer: the string from the cursor to the point that is drawing
     if (drawingPoint) {
       cursorCtx.strokeStyle = STABILIZER_COLOR;
@@ -487,47 +528,213 @@ function drawCursor(cursor, mode, penThickness, drawingPoint) {
   // Subtract half the line width so the outer edge is exactly `diameter`
   cursorCtx.arc(cursor.x, cursor.y, diameter / 2 - lineWidth / 2, 0, Math.PI * 2);
   cursorCtx.stroke();
+
+  // Waiting for the eraser to start: a red ring fills up around the cursor
+  if (eraseProgress !== null) {
+    cursorCtx.strokeStyle = ERASER_COLOR;
+    cursorCtx.lineWidth = 4;
+    cursorCtx.globalAlpha = 0.3;
+    cursorCtx.beginPath();
+    cursorCtx.arc(cursor.x, cursor.y, ERASER_RADIUS, 0, Math.PI * 2);
+    cursorCtx.stroke();
+    cursorCtx.globalAlpha = 1;
+    cursorCtx.beginPath();
+    cursorCtx.arc(cursor.x, cursor.y, ERASER_RADIUS, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * Math.min(eraseProgress, 1));
+    cursorCtx.stroke();
+  }
 }
 
 // ---------------------------------------------------------------------------
-// Gesture mode: HOVER / PEN / HIGHLIGHT
+// Hand pose: open palm, fist
+// ---------------------------------------------------------------------------
+
+// The four long fingers: tip landmark and middle joint (PIP) landmark
+const FINGERS = [
+  { tip: 8, joint: 6 }, // index
+  { tip: 12, joint: 10 }, // middle
+  { tip: 16, joint: 14 }, // ring
+  { tip: 20, joint: 18 }, // pinky
+];
+
+// A finger is extended when its tip is farther from the wrist than its
+// middle joint (curled fingers fold the tip back toward the wrist).
+function isExtended(landmarks, tip, joint) {
+  return (
+    pixelDistance(landmarks[WRIST], landmarks[tip]) >
+    pixelDistance(landmarks[WRIST], landmarks[joint])
+  );
+}
+
+// Average of the wrist and the four finger knuckles: roughly the palm center
+function palmCenter(landmarks) {
+  const ids = [WRIST, INDEX_KNUCKLE, MIDDLE_KNUCKLE, 13, PINKY_KNUCKLE];
+  return {
+    x: ids.reduce((sum, i) => sum + landmarks[i].x, 0) / ids.length,
+    y: ids.reduce((sum, i) => sum + landmarks[i].y, 0) / ids.length,
+  };
+}
+
+// Latest pose readings (null when no hand), refreshed by updatePose():
+//   allExtended: all 5 fingers extended
+//   spread:      index tip to pinky tip, in hand sizes
+//   curl:        the farthest fingertip from the palm center, in hand sizes
+//   fist:        all four fingertips curled close to the palm
+//   open:        the four fingers extended (thumb ignored)
+let pose = null;
+
+// Call once per new camera frame
+function updatePose(landmarks) {
+  if (!landmarks) {
+    pose = null;
+    return;
+  }
+  const fourExtended = FINGERS.every((f) => isExtended(landmarks, f.tip, f.joint));
+  const center = palmCenter(landmarks);
+  const size = handSize(landmarks);
+  const curl = Math.max(...FINGERS.map((f) => pixelDistance(landmarks[f.tip], center) / size));
+  const fist = curl <= FIST_CURL_THRESHOLD;
+  pose = {
+    allExtended: fourExtended && isExtended(landmarks, THUMB_TIP, THUMB_IP),
+    spread: normalizedDistance(landmarks, INDEX_TIP, PINKY_TIP),
+    curl,
+    fist,
+    open: fourExtended && !fist,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Clear-all gesture: open, fist, open, fist
+// ---------------------------------------------------------------------------
+
+let stablePose = null; // "open" | "fist" | "other" once it has held POSE_HOLD_FRAMES
+let candidatePose = null;
+let candidateCount = 0;
+const pumpSteps = []; // recent stable open/fist poses: [{ pose, time }], newest last
+
+// True while an open/fist sequence is under way. The eraser can't start then,
+// so the open-hand moments between pumps never trigger it.
+function pumpInProgress(now) {
+  return pumpSteps.length >= 2 && now - pumpSteps[0].time <= PUMP_WINDOW_MS;
+}
+
+// Call once per new camera frame. Returns true on the frame the double pump
+// is completed.
+function updatePump(now) {
+  if (!pose) {
+    stablePose = candidatePose = null;
+    candidateCount = 0;
+    pumpSteps.length = 0;
+    return false;
+  }
+
+  const raw = pose.fist ? "fist" : pose.open ? "open" : "other";
+  if (raw === candidatePose) candidateCount++;
+  else {
+    candidatePose = raw;
+    candidateCount = 1;
+  }
+  if (candidateCount < POSE_HOLD_FRAMES || raw === stablePose) return false;
+  stablePose = raw;
+  if (raw === "other") return false; // in-between poses don't count
+
+  const last = pumpSteps[pumpSteps.length - 1];
+  if (last && last.pose === raw) return false;
+  pumpSteps.push({ pose: raw, time: now });
+  if (pumpSteps.length > 4) pumpSteps.shift();
+
+  // Last four stable poses alternate, so open first means open, fist, open, fist
+  if (
+    pumpSteps.length === 4 &&
+    pumpSteps[0].pose === "open" &&
+    now - pumpSteps[0].time <= PUMP_WINDOW_MS
+  ) {
+    pumpSteps.length = 0;
+    return true;
+  }
+  return false;
+}
+
+// ---------------------------------------------------------------------------
+// Gesture mode: HOVER / PEN / HIGHLIGHT / ERASE
 // ---------------------------------------------------------------------------
 
 const MODE_HOVER = "HOVER";
 const MODE_PEN = "PEN";
 const MODE_HIGHLIGHT = "HIGHLIGHT";
+const MODE_ERASE = "ERASE";
 
 const gesture = {
   mode: MODE_HOVER, // current (debounced) mode
   candidate: null, // the mode we want to switch to, if any
   candidateFrames: 0, // how many frames in a row we have wanted it
+  eraseHoldStart: null, // when the open-palm pose began (ms), while waiting to erase
+  eraseProgress: null, // 0..1 fill of the waiting ring, null when not waiting
+  eraseLostFrames: 0, // frames in a row the open-palm pose has been missing
 };
 
-// Anything but HOVER draws
+// PEN and HIGHLIGHT draw; HOVER and ERASE don't
 function isDrawing() {
-  return gesture.mode !== MODE_HOVER;
+  return gesture.mode === MODE_PEN || gesture.mode === MODE_HIGHLIGHT;
 }
 
-// Call once per new camera frame. Updates gesture.mode from the two pinch
-// distances (thumb-index and thumb-middle):
-//   thumb touches index and middle -> HIGHLIGHT
-//   thumb touches index only       -> PEN
-//   otherwise                      -> HOVER
+function resetEraseHold() {
+  gesture.eraseHoldStart = null;
+  gesture.eraseProgress = null;
+  gesture.eraseLostFrames = 0;
+}
+
+// Call once per new camera frame, after updatePose(). Updates gesture.mode:
+//   open palm held for ERASER_HOLD_MS (from HOVER only) -> ERASE
+//   thumb touches index and middle                      -> HIGHLIGHT
+//   thumb touches index only                            -> PEN
+//   otherwise                                           -> HOVER
 //
-// Hysteresis: starting to touch needs a tighter pinch than keeping the touch,
-// so a distance hovering around one number can't flicker. The mode only
+// Pinch hysteresis: starting to touch needs a tighter pinch than keeping the
+// touch, so a distance hovering around one number can't flicker. The mode only
 // switches after the new mode has been wanted for MODE_HOLD_FRAMES frames in
 // a row. (Your index usually lands first on a 3-finger pinch, so you will often
 // pass through PEN on the way to HIGHLIGHT; updateStroke cleans that up.)
-function updateMode(landmarks) {
-  if (!landmarks) {
+function updateMode(landmarks, now) {
+  if (!landmarks || !pose) {
     // No hand: back to HOVER immediately
     gesture.mode = MODE_HOVER;
     gesture.candidate = null;
     gesture.candidateFrames = 0;
+    resetEraseHold();
     return;
   }
 
+  // --- Erasing: keep going while the palm stays open and spread ---
+  if (gesture.mode === MODE_ERASE) {
+    const holding = pose.allExtended && pose.spread >= ERASER_SPREAD_RELEASE;
+    gesture.eraseLostFrames = holding ? 0 : gesture.eraseLostFrames + 1;
+    if (gesture.eraseLostFrames >= MODE_HOLD_FRAMES) {
+      gesture.mode = MODE_HOVER;
+      resetEraseHold();
+    }
+    return;
+  }
+
+  // --- Waiting to erase: only from HOVER, never during a stroke ---
+  const canStartErase =
+    gesture.mode === MODE_HOVER && gesture.candidate === null && !pumpInProgress(now);
+  const palmPose = pose.allExtended && pose.spread >= ERASER_SPREAD_THRESHOLD;
+  if (!canStartErase) {
+    resetEraseHold();
+  } else if (palmPose) {
+    gesture.eraseLostFrames = 0;
+    if (gesture.eraseHoldStart === null) gesture.eraseHoldStart = now;
+    gesture.eraseProgress = (now - gesture.eraseHoldStart) / ERASER_HOLD_MS;
+    if (gesture.eraseProgress >= 1) {
+      gesture.mode = MODE_ERASE;
+      resetEraseHold();
+      return;
+    }
+  } else if (gesture.eraseHoldStart !== null && ++gesture.eraseLostFrames >= MODE_HOLD_FRAMES) {
+    resetEraseHold(); // lost the pose for a few frames: start over
+  }
+
+  // --- Pen / highlighter ---
   const thumbIndex = normalizedDistance(landmarks, THUMB_TIP, INDEX_TIP);
   const thumbMiddle = normalizedDistance(landmarks, THUMB_TIP, MIDDLE_TIP);
 
@@ -539,7 +746,13 @@ function updateMode(landmarks) {
       ? thumbMiddle <= HL_OFF_THRESHOLD
       : thumbMiddle < HL_ON_THRESHOLD;
 
-  const wanted = indexTouching ? (middleTouching ? MODE_HIGHLIGHT : MODE_PEN) : MODE_HOVER;
+  // A fist often has the thumb resting against the index: never draw with it
+  const wanted =
+    indexTouching && !pose.fist
+      ? middleTouching
+        ? MODE_HIGHLIGHT
+        : MODE_PEN
+      : MODE_HOVER;
 
   if (wanted === gesture.mode) {
     gesture.candidate = null;
@@ -694,6 +907,24 @@ function smoothStroke(stroke) {
   return { ...stroke, points: pts };
 }
 
+// Undo history. Each entry is a copy of the stroke list from before one
+// action (finishing a stroke, a whole erase, a clear). Strokes are never
+// changed after they are finished, so a copy only holds references and is cheap.
+const undoStack = [];
+
+function pushUndo(snapshot) {
+  undoStack.push(snapshot);
+  if (undoStack.length > UNDO_LIMIT) undoStack.shift();
+}
+
+// Swap in a different list of strokes (undo, erase) and redraw the board
+function replaceStrokes(list) {
+  strokes.length = 0;
+  strokes.push(...list);
+  rebuildCache();
+  boardDirty = true;
+}
+
 // While a stroke is in progress all its points are drawn; trimming and
 // smoothing only happen here, when it is finished.
 //
@@ -707,6 +938,7 @@ function endStroke(discardIfShort = false) {
   const tooShort = currentStroke.points.length < SHORT_STROKE_POINTS;
   if (!(tooShort && (discardIfShort || currentStroke.afterSwitch))) {
     const finished = smoothStroke(trimStroke(currentStroke));
+    pushUndo(strokes.slice());
     strokes.push(finished);
     drawStroke(cacheCtx, finished); // add it to the cache, once
   }
@@ -715,20 +947,164 @@ function endStroke(discardIfShort = false) {
   boardDirty = true;
 }
 
+// Clear the whole board. Undoable with 'z'. Returns false if it was already empty.
 function clearBoard() {
+  if (strokes.length === 0) return false;
+  pushUndo(strokes.slice());
   strokes.length = 0;
   cacheCtx.clearRect(0, 0, cache.width, cache.height); // (overshoots because of the dpr transform; harmless)
   currentStroke = null; // if the pen is still on, a new stroke starts next frame
   drawingPoint = null;
   boardDirty = true;
+  return true;
 }
 
-// Remove the last finished stroke ('z'). The stroke being drawn is not touched.
-function undoStroke() {
-  if (strokes.length === 0) return;
-  strokes.pop();
-  rebuildCache(); // redraw the remaining strokes
-  boardDirty = true;
+// Undo the last action ('z'): a stroke, a whole erase, or a clear.
+// The stroke being drawn is not touched.
+function undo() {
+  if (undoStack.length === 0) return;
+  replaceStrokes(undoStack.pop());
+  hideToast(); // "Cleared. Press z to undo" no longer applies
+}
+
+// --- Toast: a big message in the middle of the screen ---
+let toastTimer = null;
+
+function showToast(text, ms) {
+  toastEl.textContent = text;
+  toastEl.hidden = false;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(hideToast, ms);
+}
+
+function hideToast() {
+  clearTimeout(toastTimer);
+  toastEl.hidden = true;
+}
+
+// The double fist pump: clear the board and say how to get it back
+function clearByGesture() {
+  showToast(clearBoard() ? "Cleared. Press z to undo" : "Nothing to clear", CLEAR_MESSAGE_MS);
+}
+
+// --- Eraser ---
+
+// Cut the part of a stroke that lies inside the circle (center c, radius r).
+// Returns null if the circle doesn't touch the stroke, otherwise the pieces
+// left over (possibly none): the stroke is split where the circle cuts it.
+function clipStroke(stroke, c, r) {
+  const pts = stroke.points;
+  const r2 = r * r;
+  const isInside = (p) => (p.x - c.x) ** 2 + (p.y - c.y) ** 2 <= r2;
+  const lerp = (a, b, t) => ({
+    x: a.x + (b.x - a.x) * t,
+    y: a.y + (b.y - a.y) * t,
+    w: a.w + (b.w - a.w) * t,
+  });
+
+  const pieces = [];
+  let current = [];
+  let touched = false;
+  const finishPiece = () => {
+    if (current.length >= 2) pieces.push({ ...stroke, points: current });
+    current = []; // (a lone leftover point would only be a stray dot)
+  };
+
+  for (let i = 0; i < pts.length; i++) {
+    const p = pts[i];
+    if (i > 0) {
+      const a = pts[i - 1];
+      // The part of segment a->p inside the circle, as t in [0, 1]
+      const dx = p.x - a.x;
+      const dy = p.y - a.y;
+      const fx = a.x - c.x;
+      const fy = a.y - c.y;
+      const A = dx * dx + dy * dy;
+      const B = 2 * (fx * dx + fy * dy);
+      const C = fx * fx + fy * fy - r2;
+      let lo = null;
+      let hi = null;
+      if (A < 1e-9) {
+        if (C <= 0) [lo, hi] = [0, 1];
+      } else {
+        const disc = B * B - 4 * A * C;
+        if (disc > 0) {
+          const root = Math.sqrt(disc);
+          lo = Math.max((-B - root) / (2 * A), 0);
+          hi = Math.min((-B + root) / (2 * A), 1);
+        }
+      }
+      if (lo !== null && hi > lo) {
+        touched = true;
+        if (lo > 0) current.push(lerp(a, p, lo)); // where the stroke enters the circle
+        finishPiece();
+        if (hi < 1) current.push(lerp(a, p, hi)); // where it comes out again
+      }
+    }
+    if (isInside(p)) touched = true;
+    else current.push(p);
+  }
+  finishPiece();
+
+  // A stroke that is a single dot outside the circle was never touched
+  return touched ? pieces : null;
+}
+
+// Erase at one spot. Returns the new list of strokes, or null if nothing changed.
+function eraseAt(list, c) {
+  let changed = false;
+  const out = [];
+  for (const stroke of list) {
+    const pieces = clipStroke(stroke, c, ERASER_RADIUS);
+    if (pieces === null) {
+      out.push(stroke);
+    } else {
+      changed = true;
+      out.push(...pieces);
+    }
+  }
+  return changed ? out : null;
+}
+
+const eraser = {
+  active: false, // true during one continuous erase
+  last: null, // where the eraser was on the previous frame
+  snapshot: null, // strokes from before this erase, for undo
+  changed: false, // did this erase remove anything yet?
+};
+
+// Call once per new camera frame, after updateMode().
+// A continuous erase (ERASE mode from start to end) is one undo action.
+function updateEraser(cursor) {
+  if (gesture.mode === MODE_ERASE && cursor) {
+    if (!eraser.active) {
+      eraser.active = true;
+      eraser.snapshot = strokes.slice();
+      eraser.changed = false;
+      eraser.last = null;
+    }
+
+    // Erase along the path since last frame too, so a fast sweep can't skip
+    // over a stroke between two camera frames
+    const from = eraser.last || cursor;
+    const steps = Math.max(1, Math.ceil(Math.hypot(cursor.x - from.x, cursor.y - from.y) / (ERASER_RADIUS / 2)));
+    let result = null;
+    for (let i = 1; i <= steps; i++) {
+      const t = i / steps;
+      const spot = { x: from.x + (cursor.x - from.x) * t, y: from.y + (cursor.y - from.y) * t };
+      result = eraseAt(result || strokes, spot) || result;
+    }
+    if (result) {
+      replaceStrokes(result);
+      eraser.changed = true;
+    }
+    eraser.last = { x: cursor.x, y: cursor.y };
+  } else if (eraser.active) {
+    if (eraser.changed) pushUndo(eraser.snapshot);
+    eraser.active = false;
+    eraser.snapshot = null;
+    eraser.last = null;
+  }
 }
 
 // Call once per new camera frame, after updateMode().
@@ -957,6 +1333,9 @@ function updateInfoBox(fps, landmarks, cursor) {
     modeEl.textContent = gesture.mode;
     // raw / smoothed, to help set HAND_SIZE_FAR and HAND_SIZE_NEAR
     handSizeEl.textContent = `${Math.round(handSizeRaw)} / ${Math.round(handSizeSmoothed)}`;
+    // Pose readings next to the thresholds they are compared with
+    spreadEl.textContent = `${pose.spread.toFixed(2)} (erase at ${ERASER_SPREAD_THRESHOLD.toFixed(2)}+)`;
+    fistEl.textContent = `${pose.curl.toFixed(2)} (fist at ${FIST_CURL_THRESHOLD.toFixed(2)} or less)`;
   } else {
     handEl.textContent = "no";
     distTIEl.textContent = "–";
@@ -964,6 +1343,8 @@ function updateInfoBox(fps, landmarks, cursor) {
     cursorPosEl.textContent = "–";
     modeEl.textContent = "–";
     handSizeEl.textContent = "–";
+    spreadEl.textContent = `– (erase at ${ERASER_SPREAD_THRESHOLD.toFixed(2)}+)`;
+    fistEl.textContent = `– (fist at ${FIST_CURL_THRESHOLD.toFixed(2)} or less)`;
   }
   thicknessEl.textContent =
     gesture.mode === MODE_HIGHLIGHT
@@ -997,10 +1378,13 @@ function startLoop(handTracker) {
       const jumped = detectJump(rawCursor);
       if (jumped) resetCursorFilters(); // new position, no sliding from the old one
       cursor = smoothCursor(rawCursor, now);
-      updateMode(landmarks);
+      updatePose(landmarks);
+      updateMode(landmarks, now);
+      if (updatePump(now)) clearByGesture();
       updateHandSize(landmarks);
       updateThickness(); // after updateMode: it is locked while a stroke is drawn
       updateStroke(cursor, jumped);
+      updateEraser(cursor);
       frameCount++;
     }
 
@@ -1012,7 +1396,7 @@ function startLoop(handTracker) {
     }
 
     drawBoard();
-    drawCursor(cursor, gesture.mode, thickness, drawingPoint);
+    drawCursor(cursor, gesture.mode, thickness, drawingPoint, gesture.eraseProgress);
     if (previewVisible()) drawPreviewOverlay(landmarks);
     updateInfoBox(fps, landmarks, cursor);
 
@@ -1067,7 +1451,7 @@ async function main() {
       case "c": preview.classList.toggle("hidden"); break; // camera preview
       case "h": document.body.classList.toggle("ui-hidden"); break; // info box + preview
       case "b": darkBoard = !darkBoard; applyTheme(); break; // board color
-      case "z": undoStroke(); break;
+      case "z": undo(); break;
       case "x": clearBoard(); break;
       case "s": toggleSmoothing(); break;
       case "v": toggleStabilizer(); break;

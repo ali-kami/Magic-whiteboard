@@ -32,6 +32,8 @@
     <div>Hand size: <span id="handSize">–</span> px (raw / smooth)</div>
     <div>Thickness: <span id="thickness">–</span></div>
     <div>Stabilizer: <span id="stabilizer">on</span></div>
+    <div>Spread: <span id="spread">–</span></div>
+    <div>Fist: <span id="fist">–</span></div>
     <div>Camera: <span id="camera">–</span></div>
     <div class="keys">
       <div>c camera preview</div>
@@ -42,11 +44,16 @@
       <div>s smoothing on/off</div>
       <div>v stabilizer on/off</div>
       <div>f fullscreen</div>
+      <div>open palm, hold: erase</div>
+      <div>fist pump x2: clear all</div>
     </div>
   </div>
 
   <!-- Status / error message, centered on screen -->
   <div id="message">Starting…</div>
+
+  <!-- Big temporary message, e.g. after clearing the board -->
+  <div id="toast" hidden></div>
 
   <script type="module" src="main.js"></script>
 </body>
