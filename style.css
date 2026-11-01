@@ -25,6 +25,20 @@ body {
   background: #fff;
 }
 
+/* Dark board (default, toggled with 'b'): black background, white ink.
+   main.js adds/removes the "dark" class on <body>. */
+body.dark,
+body.dark #board {
+  background: #000;
+}
+
+/* 'h' hides the info box and camera preview together. visibility (not
+   display:none) so tracking keeps running. The cursor and messages stay. */
+body.ui-hidden #info,
+body.ui-hidden #preview {
+  visibility: hidden;
+}
+
 #cursor {
   pointer-events: none;
 }
@@ -78,6 +92,16 @@ body {
   color: #fff;
   font: 14px/1.5 ui-monospace, Menlo, Consolas, monospace;
   border-radius: 8px;
+}
+
+/* Key cheat sheet at the bottom of the info box */
+#info .keys {
+  margin-top: 8px;
+  padding-top: 6px;
+  border-top: 1px solid rgba(255, 255, 255, 0.3);
+  font-size: 12px;
+  line-height: 1.4;
+  opacity: 0.85;
 }
 
 #info[hidden] {

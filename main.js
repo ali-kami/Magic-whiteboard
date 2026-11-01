@@ -1,19 +1,40 @@
-// MagicBoard – step 5: pen thickness from hand distance to the camera.
-// Pipeline: webcam -> MediaPipe HandLandmarker -> cursor + pen state + hand
+// MagicBoard – step 7: highlighter gesture (on top of presentation mode).
+// Pipeline: webcam -> MediaPipe HandLandmarker -> cursor + gesture mode + hand
 // size (depth) -> strokes on the whiteboard, plus a small camera preview with
-// the skeleton.
+// the skeleton. Keys: c h b z x s f (see the cheat sheet in the info box).
 
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
 
 // --- Pen gesture tuning (normalized thumb–index distance; 1.0 = hand size) ---
-const PEN_ON_THRESHOLD = 0.25; // pinch tighter than this -> pen turns ON
-const PEN_OFF_THRESHOLD = 0.35; // open wider than this -> pen turns OFF
-const PEN_HOLD_FRAMES = 3; // new state must hold this many frames in a row
+// Gesture modes: HOVER (no pinch), PEN (thumb touches index), HIGHLIGHT (thumb
+// touches index AND middle). Each "touch" uses hysteresis: it starts below the
+// ON threshold and only ends above the OFF threshold.
+const PEN_ON_THRESHOLD = 0.25; // thumb-index below this -> touching
+const PEN_OFF_THRESHOLD = 0.35; // thumb-index above this -> not touching
+const HL_ON_THRESHOLD = 0.25; // thumb-middle below this -> touching
+const HL_OFF_THRESHOLD = 0.35; // thumb-middle above this -> not touching
+const MODE_HOLD_FRAMES = 3; // a new mode must hold this many frames in a row
 
-// --- Pen look ---
-const PEN_COLOR = "#000";
+// A stroke cut short by a direct PEN <-> HIGHLIGHT switch is deleted if it has
+// fewer than this many points (the stray mark made while the fingers settle)
+const SHORT_STROKE_POINTS = 10;
+
+// --- Highlighter look ---
+const HIGHLIGHT_COLOR = "#ffe600"; // yellow
+const HIGHLIGHT_ALPHA = 0.35; // 35% opacity
+const HIGHLIGHT_WIDTH_FACTOR = 3; // width = this x the current thickness level
+
+// --- Board colors (toggle with 'b') ---
+// Strokes don't store a color: they are drawn in the theme's "ink", so
+// switching the theme recolors everything already on the board.
+const DARK_BOARD_DEFAULT = true; // black board + white ink looks best on a cheap projector
+const THEMES = {
+  dark: { ink: "#fff", ring: "#ccc" }, // ring = hover cursor color
+  light: { ink: "#000", ring: "#444" },
+};
+// (the board background color itself is in style.css: body.dark)
 
 // --- Pen thickness from hand distance to the camera ---
 // Depth signal = hand size in video pixels (bigger = closer). Watch the "Hand
@@ -86,9 +107,8 @@ const ACTIVE_ZONE = 0.6;
 
 // The cursor matches the pen thickness: a hollow ring while hovering, a solid
 // dot while drawing. Minimums keep thin pens visible.
-const RING_MIN_DIAMETER = 12; // px
-const DOT_MIN_DIAMETER = 4; // px
-const CURSOR_COLOR = "#444"; // dark gray
+const CURSOR_MIN_SIZE = 12; // px, smallest hover ring diameter. Raise it to see the cursor better on a wall
+const DOT_MIN_DIAMETER = 4; // px, smallest drawing dot
 
 // ---------------------------------------------------------------------------
 // Page elements
@@ -233,22 +253,22 @@ let thickness = THICKNESS_LEVELS[1]; // current pen thickness in px
 // change the level, so when the pen turns on we lock to the level from a few
 // frames earlier, before the pinch began.
 const levelHistory = [];
-let penWasOn = false;
+let wasDrawing = false;
 
 // Map the smoothed hand size to one of the thickness levels.
-// Call once per new camera frame, after updatePen() and updateHandSize().
+// Call once per new camera frame, after updateMode() and updateHandSize().
 function updateThickness() {
-  const penJustTurnedOn = pen.on && !penWasOn;
-  penWasOn = pen.on;
+  const drawingJustStarted = isDrawing() && !wasDrawing;
+  wasDrawing = isDrawing();
 
   if (handSizeSmoothed === null) {
     levelHistory.length = 0; // hand lost: old levels are stale
     return;
   }
 
-  // The pen just turned on: lock to the level from THICKNESS_LOCK_LOOKBACK
+  // Drawing just started: lock to the level from THICKNESS_LOCK_LOOKBACK
   // frames ago (the oldest one in the history)
-  if (penJustTurnedOn && !LIVE_THICKNESS && levelHistory.length > 0) {
+  if (drawingJustStarted && !LIVE_THICKNESS && levelHistory.length > 0) {
     thicknessLevel = levelHistory[0];
     thickness = THICKNESS_LEVELS[thicknessLevel];
     return;
@@ -256,7 +276,7 @@ function updateThickness() {
 
   // Locked: while a stroke is being drawn the thickness stays as it was
   // when the stroke started (unless LIVE_THICKNESS is on)
-  if (pen.on && !LIVE_THICKNESS) return;
+  if (isDrawing() && !LIVE_THICKNESS) return;
 
   const count = THICKNESS_LEVELS.length;
   const t = clamp((handSizeSmoothed - HAND_SIZE_FAR) / (HAND_SIZE_NEAR - HAND_SIZE_FAR), 0, 1);
@@ -392,23 +412,28 @@ function detectJump(rawCursor) {
 }
 
 // Draw the cursor on its own layer. Pass null to just clear it.
-//   hovering: hollow dark gray ring, as wide as the pen thickness
-//   drawing:  solid dot in the pen color, as wide as the stroke thickness
-function drawCursor(cursor, penOn, penThickness) {
+//   hovering:  hollow ring, as wide as the pen thickness (at least CURSOR_MIN_SIZE)
+//   pen:       solid dot in the ink color, as wide as the stroke
+//   highlight: solid yellow dot, as wide as the (3x) highlighter stroke
+function drawCursor(cursor, mode, penThickness) {
   cursorCtx.clearRect(0, 0, cursorCanvas.clientWidth, cursorCanvas.clientHeight);
   if (!cursor) return;
 
-  if (penOn) {
-    cursorCtx.fillStyle = PEN_COLOR;
+  if (mode !== MODE_HOVER) {
+    const highlight = mode === MODE_HIGHLIGHT;
+    const width = penThickness * (highlight ? HIGHLIGHT_WIDTH_FACTOR : 1);
+    cursorCtx.fillStyle = highlight ? HIGHLIGHT_COLOR : currentTheme().ink;
+    cursorCtx.globalAlpha = highlight ? 0.7 : 1; // see-through enough to read, but visible
     cursorCtx.beginPath();
-    cursorCtx.arc(cursor.x, cursor.y, Math.max(penThickness, DOT_MIN_DIAMETER) / 2, 0, Math.PI * 2);
+    cursorCtx.arc(cursor.x, cursor.y, Math.max(width, DOT_MIN_DIAMETER) / 2, 0, Math.PI * 2);
     cursorCtx.fill();
+    cursorCtx.globalAlpha = 1;
     return;
   }
 
   const lineWidth = 2;
-  const diameter = Math.max(penThickness, RING_MIN_DIAMETER);
-  cursorCtx.strokeStyle = CURSOR_COLOR;
+  const diameter = Math.max(penThickness, CURSOR_MIN_SIZE);
+  cursorCtx.strokeStyle = currentTheme().ring;
   cursorCtx.lineWidth = lineWidth;
   cursorCtx.beginPath();
   // Subtract half the line width so the outer edge is exactly `diameter`
@@ -417,36 +442,72 @@ function drawCursor(cursor, penOn, penThickness) {
 }
 
 // ---------------------------------------------------------------------------
-// Pen gesture
+// Gesture mode: HOVER / PEN / HIGHLIGHT
 // ---------------------------------------------------------------------------
 
-const pen = {
-  on: false, // current (debounced) pen state
-  framesInOtherState: 0, // how many frames in a row want to switch it
+const MODE_HOVER = "HOVER";
+const MODE_PEN = "PEN";
+const MODE_HIGHLIGHT = "HIGHLIGHT";
+
+const gesture = {
+  mode: MODE_HOVER, // current (debounced) mode
+  candidate: null, // the mode we want to switch to, if any
+  candidateFrames: 0, // how many frames in a row we have wanted it
 };
 
-// Call once per new camera frame. Updates pen.on from the pinch distance.
+// Anything but HOVER draws
+function isDrawing() {
+  return gesture.mode !== MODE_HOVER;
+}
+
+// Call once per new camera frame. Updates gesture.mode from the two pinch
+// distances (thumb-index and thumb-middle):
+//   thumb touches index and middle -> HIGHLIGHT
+//   thumb touches index only       -> PEN
+//   otherwise                      -> HOVER
 //
-// Hysteresis: turning ON needs a tighter pinch than staying on, so a distance
-// hovering around one number can't flicker. Between the two thresholds the pen
-// keeps whatever state it has. A switch also has to be wanted for
-// PEN_HOLD_FRAMES frames in a row.
-function updatePen(landmarks) {
+// Hysteresis: starting to touch needs a tighter pinch than keeping the touch,
+// so a distance hovering around one number can't flicker. The mode only
+// switches after the new mode has been wanted for MODE_HOLD_FRAMES frames in
+// a row. (Your index usually lands first on a 3-finger pinch, so you will often
+// pass through PEN on the way to HIGHLIGHT; updateStroke cleans that up.)
+function updateMode(landmarks) {
   if (!landmarks) {
-    // No hand: pen is off immediately
-    pen.on = false;
-    pen.framesInOtherState = 0;
+    // No hand: back to HOVER immediately
+    gesture.mode = MODE_HOVER;
+    gesture.candidate = null;
+    gesture.candidateFrames = 0;
     return;
   }
 
-  const distance = normalizedDistance(landmarks, THUMB_TIP, INDEX_TIP);
-  const wantsOn = pen.on ? distance <= PEN_OFF_THRESHOLD : distance < PEN_ON_THRESHOLD;
+  const thumbIndex = normalizedDistance(landmarks, THUMB_TIP, INDEX_TIP);
+  const thumbMiddle = normalizedDistance(landmarks, THUMB_TIP, MIDDLE_TIP);
 
-  if (wantsOn === pen.on) {
-    pen.framesInOtherState = 0;
-  } else if (++pen.framesInOtherState >= PEN_HOLD_FRAMES) {
-    pen.on = wantsOn;
-    pen.framesInOtherState = 0;
+  const indexTouching = isDrawing()
+    ? thumbIndex <= PEN_OFF_THRESHOLD
+    : thumbIndex < PEN_ON_THRESHOLD;
+  const middleTouching =
+    gesture.mode === MODE_HIGHLIGHT
+      ? thumbMiddle <= HL_OFF_THRESHOLD
+      : thumbMiddle < HL_ON_THRESHOLD;
+
+  const wanted = indexTouching ? (middleTouching ? MODE_HIGHLIGHT : MODE_PEN) : MODE_HOVER;
+
+  if (wanted === gesture.mode) {
+    gesture.candidate = null;
+    gesture.candidateFrames = 0;
+    return;
+  }
+  if (wanted === gesture.candidate) {
+    gesture.candidateFrames++;
+  } else {
+    gesture.candidate = wanted; // wanting something new: start counting again
+    gesture.candidateFrames = 1;
+  }
+  if (gesture.candidateFrames >= MODE_HOLD_FRAMES) {
+    gesture.mode = wanted;
+    gesture.candidate = null;
+    gesture.candidateFrames = 0;
   }
 }
 
@@ -454,11 +515,15 @@ function updatePen(landmarks) {
 // Strokes and the whiteboard
 // ---------------------------------------------------------------------------
 
-// A stroke is { live, points }, where points is [{ x, y, w }, ...]: board
-// pixels plus the line width at that point. Every stroke stores its own
-// widths, so redrawing (cache rebuild after a resize) always looks the same.
+// A stroke is { tool, live, points }, where points is [{ x, y, w }, ...]:
+// board pixels plus the line width at that point. Every stroke stores its tool
+// and its own widths, so redrawing (undo, theme switch, cache rebuild after a
+// resize) always looks the same.
+//   tool "pen":       drawn in the theme's ink color
+//   tool "highlight": drawn in yellow at 35% opacity, as one path so it doesn't
+//                     get darker where it crosses itself (always one width)
 //   live false: all points share one width (locked at stroke start)
-//   live true:  each segment uses the width of its end point
+//   live true:  each segment uses the width of its end point (pen only)
 const strokes = []; // finished strokes
 let currentStroke = null; // the stroke being drawn right now, or null
 let boardDirty = true; // true when the board needs to be redrawn
@@ -473,7 +538,7 @@ const cacheCtx = cache.getContext("2d");
 // Pen look; set before drawing strokes (resizing a canvas resets its settings).
 // Line width is set per stroke in drawStroke().
 function applyPenStyle(ctx) {
-  ctx.strokeStyle = PEN_COLOR;
+  ctx.strokeStyle = currentTheme().ink;
   ctx.lineCap = "round";
   ctx.lineJoin = "round";
 }
@@ -488,11 +553,34 @@ function rebuildCache() {
   for (const stroke of strokes) drawStroke(cacheCtx, stroke);
 }
 
-// Start a new stroke at the cursor, using the current pen thickness
-function startStroke(cursor) {
+// --- Board theme ---
+let darkBoard = DARK_BOARD_DEFAULT;
+
+function currentTheme() {
+  return darkBoard ? THEMES.dark : THEMES.light;
+}
+
+// Set the board background (body.dark in style.css) and redraw all strokes
+// in the new ink color
+function applyTheme() {
+  document.body.classList.toggle("dark", darkBoard);
+  rebuildCache();
+  boardDirty = true;
+}
+
+// Line width for a tool at the current thickness level
+function strokeWidth(tool) {
+  return thickness * (tool === "highlight" ? HIGHLIGHT_WIDTH_FACTOR : 1);
+}
+
+// Start a new stroke at the cursor, using the current thickness.
+// afterSwitch: it starts right after a direct PEN <-> HIGHLIGHT switch.
+function startStroke(cursor, tool, afterSwitch) {
   currentStroke = {
-    live: LIVE_THICKNESS,
-    points: [{ x: cursor.x, y: cursor.y, w: thickness }],
+    tool,
+    live: LIVE_THICKNESS && tool === "pen", // a highlighter keeps one width
+    afterSwitch,
+    points: [{ x: cursor.x, y: cursor.y, w: strokeWidth(tool) }],
   };
   boardDirty = true;
 }
@@ -510,14 +598,22 @@ function trimStroke(stroke) {
 
 // While a stroke is in progress all its points are drawn; trimming only
 // happens here, when it is finished.
-function endStroke() {
-  if (currentStroke) {
+//
+// discardIfShort: the stroke is ending because of a direct PEN <-> HIGHLIGHT
+// switch. A short stroke there is just the mark made while the fingers settle,
+// so it is deleted. The same goes for a short stroke that itself began right
+// after such a switch (e.g. the PEN blip when you let go of the middle finger).
+function endStroke(discardIfShort = false) {
+  if (!currentStroke) return;
+
+  const tooShort = currentStroke.points.length < SHORT_STROKE_POINTS;
+  if (!(tooShort && (discardIfShort || currentStroke.afterSwitch))) {
     const finished = trimStroke(currentStroke);
     strokes.push(finished);
     drawStroke(cacheCtx, finished); // add it to the cache, once
-    currentStroke = null;
-    boardDirty = true;
   }
+  currentStroke = null;
+  boardDirty = true;
 }
 
 function clearBoard() {
@@ -527,37 +623,68 @@ function clearBoard() {
   boardDirty = true;
 }
 
-// Call once per new camera frame, after updatePen().
-// Pen on -> start/extend a stroke. Pen off or hand lost -> end it.
+// Remove the last finished stroke ('z'). The stroke being drawn is not touched.
+function undoStroke() {
+  if (strokes.length === 0) return;
+  strokes.pop();
+  rebuildCache(); // redraw the remaining strokes
+  boardDirty = true;
+}
+
+// Call once per new camera frame, after updateMode().
+// PEN / HIGHLIGHT -> start/extend a stroke. HOVER or hand lost -> end it.
 // jumped: the raw cursor made a tracking-glitch jump this frame (see
 // detectJump), so the current stroke ends and a new one starts.
 function updateStroke(cursor, jumped) {
   if (jumped) endStroke(); // don't draw a long stray line
 
-  if (!pen.on || !cursor) {
+  if (!isDrawing() || !cursor) {
     endStroke();
     return;
   }
 
+  const tool = gesture.mode === MODE_HIGHLIGHT ? "highlight" : "pen";
+
+  // PEN <-> HIGHLIGHT during a stroke: end it (deleting it if it is just a
+  // short blip) and start a new one with the new tool
+  let afterSwitch = false;
+  if (currentStroke && currentStroke.tool !== tool) {
+    endStroke(true);
+    afterSwitch = true;
+  }
+
   if (!currentStroke) {
-    startStroke(cursor);
+    startStroke(cursor, tool, afterSwitch);
   } else {
     // `thickness` is frozen while drawing unless LIVE_THICKNESS is on, so
     // this is the locked width in the normal case
-    currentStroke.points.push({ x: cursor.x, y: cursor.y, w: thickness });
+    currentStroke.points.push({ x: cursor.x, y: cursor.y, w: strokeWidth(tool) });
     boardDirty = true;
   }
 }
 
-// Trace one stroke as a smooth line. Each point acts as a control point of a
+// Draw one stroke (pen or highlighter) as a smooth line. Each point acts as a control point of a
 // quadratic curve that ends at the midpoint to the next point, which rounds
 // off the corners between samples.
 function drawStroke(ctx, stroke) {
+  const highlight = stroke.tool === "highlight";
+  const color = highlight ? HIGHLIGHT_COLOR : currentTheme().ink;
+
+  ctx.save();
+  ctx.strokeStyle = color;
+  ctx.fillStyle = color;
+  // One stroke() call per path with globalAlpha: the path is composited once,
+  // so a highlighter crossing itself doesn't get darker
+  if (highlight) ctx.globalAlpha = HIGHLIGHT_ALPHA;
+  drawStrokeShape(ctx, stroke);
+  ctx.restore();
+}
+
+function drawStrokeShape(ctx, stroke) {
   const pts = stroke.points;
 
   if (pts.length === 1) {
     // A single tap: just a dot
-    ctx.fillStyle = PEN_COLOR;
     ctx.beginPath();
     ctx.arc(pts[0].x, pts[0].y, pts[0].w / 2, 0, Math.PI * 2);
     ctx.fill();
@@ -724,7 +851,7 @@ function updateInfoBox(fps, landmarks, cursor) {
     distTIEl.textContent = normalizedDistance(landmarks, THUMB_TIP, INDEX_TIP).toFixed(2);
     distTMEl.textContent = normalizedDistance(landmarks, THUMB_TIP, MIDDLE_TIP).toFixed(2);
     cursorPosEl.textContent = `${Math.round(cursor.x)}, ${Math.round(cursor.y)}`;
-    modeEl.textContent = pen.on ? "PEN" : "HOVER";
+    modeEl.textContent = gesture.mode;
     // raw / smoothed, to help set HAND_SIZE_FAR and HAND_SIZE_NEAR
     handSizeEl.textContent = `${Math.round(handSizeRaw)} / ${Math.round(handSizeSmoothed)}`;
   } else {
@@ -735,7 +862,10 @@ function updateInfoBox(fps, landmarks, cursor) {
     modeEl.textContent = "–";
     handSizeEl.textContent = "–";
   }
-  thicknessEl.textContent = `${thickness}px`;
+  thicknessEl.textContent =
+    gesture.mode === MODE_HIGHLIGHT
+      ? `${thickness}px (highlighter ${strokeWidth("highlight")}px)`
+      : `${thickness}px`;
 }
 
 // ---------------------------------------------------------------------------
@@ -764,9 +894,9 @@ function startLoop(handTracker) {
       const jumped = detectJump(rawCursor);
       if (jumped) resetCursorFilters(); // new position, no sliding from the old one
       cursor = smoothCursor(rawCursor, now);
-      updatePen(landmarks);
+      updateMode(landmarks);
       updateHandSize(landmarks);
-      updateThickness(); // after updatePen: it is locked while a stroke is drawn
+      updateThickness(); // after updateMode: it is locked while a stroke is drawn
       updateStroke(cursor, jumped);
       frameCount++;
     }
@@ -779,8 +909,8 @@ function startLoop(handTracker) {
     }
 
     drawBoard();
-    drawCursor(cursor, pen.on, thickness);
-    if (!preview.classList.contains("hidden")) drawPreviewOverlay(landmarks);
+    drawCursor(cursor, gesture.mode, thickness);
+    if (previewVisible()) drawPreviewOverlay(landmarks);
     updateInfoBox(fps, landmarks, cursor);
 
     requestAnimationFrame(tick);
@@ -789,24 +919,49 @@ function startLoop(handTracker) {
 }
 
 // ---------------------------------------------------------------------------
+// Key actions
+// ---------------------------------------------------------------------------
+
+function toggleSmoothing() {
+  smoothingOn = !smoothingOn;
+  resetCursorFilters(); // start fresh so there's no jump when switching
+  smoothingEl.textContent = smoothingOn ? "on" : "off";
+}
+
+function toggleFullscreen() {
+  if (document.fullscreenElement) {
+    document.exitFullscreen();
+  } else {
+    // The browser can refuse (e.g. not allowed here); that's not worth an error screen
+    document.documentElement.requestFullscreen().catch((err) => console.warn(err));
+  }
+}
+
+// The camera preview is shown unless 'c' hid it or 'h' hid the whole UI
+function previewVisible() {
+  return !preview.classList.contains("hidden") && !document.body.classList.contains("ui-hidden");
+}
+
+// ---------------------------------------------------------------------------
 // Start-up
 // ---------------------------------------------------------------------------
 
 async function main() {
+  document.body.classList.toggle("dark", darkBoard); // default board color
   resizeCanvases();
   window.addEventListener("resize", resizeCanvases);
 
-  // Keys: 'c' shows/hides the camera preview, 'x' clears the board,
-  // 's' turns cursor smoothing on/off
+  // Keys (also listed in the info box)
   window.addEventListener("keydown", (event) => {
-    if (event.metaKey || event.ctrlKey || event.altKey) return;
-    const key = event.key.toLowerCase();
-    if (key === "c") preview.classList.toggle("hidden");
-    if (key === "x") clearBoard();
-    if (key === "s") {
-      smoothingOn = !smoothingOn;
-      resetCursorFilters(); // start fresh so there's no jump when switching
-      smoothingEl.textContent = smoothingOn ? "on" : "off";
+    if (event.metaKey || event.ctrlKey || event.altKey || event.repeat) return;
+    switch (event.key.toLowerCase()) {
+      case "c": preview.classList.toggle("hidden"); break; // camera preview
+      case "h": document.body.classList.toggle("ui-hidden"); break; // info box + preview
+      case "b": darkBoard = !darkBoard; applyTheme(); break; // board color
+      case "z": undoStroke(); break;
+      case "x": clearBoard(); break;
+      case "s": toggleSmoothing(); break;
+      case "f": toggleFullscreen(); break;
     }
   });
 

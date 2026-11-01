@@ -2,7 +2,7 @@
 
 A whiteboard you draw on with hand gestures, using a webcam and a projector.
 
-**Step 5 (this version): pen thickness from hand distance** on top of smoothing, clean strokes and the pen gesture. The window is a white
+**Step 7 (this version): highlighter gesture** on top of presentation mode, pen thickness, smoothing, clean strokes and the pen gesture. The window is a white
 whiteboard, a small camera preview with your hand skeleton sits in the
 bottom-right corner, and a cursor follows the midpoint between your thumb and
 index fingertips. Pinch thumb and index together to draw; open them to hover.
@@ -23,17 +23,31 @@ is needed on first load (MediaPipe and the hand model come from a CDN).
 
 ## What you should see
 
-- A full-window white whiteboard.
+- A full-window whiteboard (black by default; white with `b`).
 - A small mirrored camera preview (about 25% of the window width) in the bottom-right,
   with the hand skeleton and the red **T**, blue **I**, green **M** fingertips.
 - A faint dashed rectangle on the preview: the **active zone**. Keep your hand inside it.
-- **Pen gesture:** pinch thumb and index to draw a black 4px line. The pen turns
-  ON when the normalized thumb–index distance drops below `0.25` and OFF when it
-  rises above `0.35`, and a change must hold for 3 camera frames. Tune these with
-  the constants at the top of `main.js`. The middle finger is ignored for now.
-- While hovering the cursor is a hollow dark gray ring; while drawing it becomes a
-  solid black dot, slightly smaller. The info box shows `Mode: PEN` or `Mode: HOVER`.
-- A stroke ends if the pen turns off, the hand disappears, or the cursor jumps
+- **Gestures** (one mode at a time; a new mode must hold for 3 camera frames):
+  - `HOVER`: no pinch. Just the cursor.
+  - `PEN`: thumb touches index (thumb–index below `PEN_ON_THRESHOLD` 0.25, stays on
+    until above `PEN_OFF_THRESHOLD` 0.35). Draws ink.
+  - `HIGHLIGHT`: thumb touches index **and** middle (thumb–middle below
+    `HL_ON_THRESHOLD` 0.25, stays on until above `HL_OFF_THRESHOLD` 0.35). Draws a
+    yellow highlighter at 35% opacity, 3x the current thickness, as one path so it
+    doesn't darken where it crosses itself.
+  All thresholds are constants at the top of `main.js`.
+- Your index usually lands first on a 3-finger pinch, so PEN may start for a few
+  frames before HIGHLIGHT. On a direct PEN <-> HIGHLIGHT switch the current stroke
+  ends, and if it has fewer than `SHORT_STROKE_POINTS` (10) points it is deleted, so
+  no stray mark is left. A short stroke that *starts* right after such a switch is
+  deleted too (the PEN blip when you let go of the middle finger).
+- Each stroke stores its tool (pen or highlight), so undo, `b` theme switch, the
+  cache and resize all redraw it correctly. Highlighter color doesn't change with
+  the theme. A highlighter always has one width, even with `LIVE_THICKNESS`.
+- While hovering the cursor is a hollow ring; while drawing it becomes a solid dot
+  (ink color for the pen, yellow and 3x wider for the highlighter). The info box
+  shows `Mode: HOVER`, `PEN` or `HIGHLIGHT`.
+- A stroke ends if you go back to HOVER, the hand disappears, or the cursor jumps
   more than 150px in one frame (so tracking glitches don't leave stray lines).
 - **Smoothing:** the cursor is passed through a One Euro filter (`MIN_CUTOFF`,
   `BETA`, `D_CUTOFF` at the top of `main.js`). Lower `MIN_CUTOFF` = steadier but
@@ -64,6 +78,10 @@ is needed on first load (MediaPipe and the hand model come from a CDN).
 **Tuning the range:** hold your hand open at the farthest distance you'd
 comfortably draw, read the *smooth* number in `Hand size`, and put it in
 `HAND_SIZE_FAR`. Do the same at the closest distance for `HAND_SIZE_NEAR`.
+- **Projector use:** the board starts black with white ink. Strokes are stored
+  without a color, so `b` recolors everything already drawn. The info box ends with
+  a key cheat sheet. `CURSOR_MIN_SIZE` (top of `main.js`) sets the smallest hover
+  ring, so raise it if the cursor is hard to see on the wall.
 - A cursor at the midpoint of your thumb and index tips.
   The active zone (middle 60% of the camera frame) covers the whole board, so
   reaching a zone edge puts the cursor at the matching board edge. The cursor
@@ -76,6 +94,10 @@ comfortably draw, read the *smooth* number in `Hand size`, and put it in
 | Key | Action |
 | --- | --- |
 | `c` | Show / hide the camera preview (tracking keeps running while hidden) |
+| `h` | Hide / show the info box and camera preview together (the cursor stays) |
+| `b` | Toggle board color: black board + white ink (default) / white board + black ink. Existing strokes change color too |
+| `z` | Undo the last finished stroke |
+| `f` | Toggle fullscreen |
 | `x` | Clear the board |
 | `s` | Turn cursor smoothing on / off (shown in the info box) |
 
@@ -92,7 +114,7 @@ instead of a blank page.
 
 In `main.js`: hand tracking is `createHandTracker()`, `startCamera()`,
 `detectHand()` and the distance helpers; the cursor is `getCursor()` and
-`drawCursor()`; the pen is `updatePen()`; strokes are `updateStroke()`,
+`drawCursor()`; the gesture mode is `updateMode()`; strokes are `updateStroke()`,
 `trimStroke()`, `detectJump()`, `handDepthSize()`, `updateThickness()`, `drawStroke()`, `rebuildCache()` and `drawBoard()`; smoothing is `OneEuroFilter` and
 `smoothCursor()`. The whiteboard (`#board`) and the cursor
 (`#cursor`) are separate canvases so strokes aren't erased when the cursor moves.
