@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>MagicBoard</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <!-- Live webcam feed (mirrored with CSS) -->
+  <video id="video" autoplay playsinline muted></video>
+
+  <!-- Hand skeleton is drawn here, on top of the video -->
+  <canvas id="overlay"></canvas>
+
+  <!-- Info box, top-left -->
+  <div id="info" hidden>
+    <div>FPS: <span id="fps">0</span></div>
+    <div>Hand detected: <span id="hand">no</span></div>
+    <div>Thumb–Index: <span id="distTI">–</span></div>
+    <div>Thumb–Middle: <span id="distTM">–</span></div>
+  </div>
+
+  <!-- Status / error message, centered on screen -->
+  <div id="message">Starting…</div>
+
+  <script type="module" src="main.js"></script>
+</body>
+</html>

@@ -1,0 +1,75 @@
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: #000;
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+/* Video and canvas both fill the whole window and sit on top of each other */
+#video,
+#overlay {
+  position: fixed;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+}
+
+/* "cover" fills the window (cropping edges if aspect ratios differ).
+   scaleX(-1) mirrors the video like a selfie. main.js uses the same
+   cover + mirror maths when drawing landmarks, so they line up. */
+#video {
+  object-fit: cover;
+  transform: scaleX(-1);
+}
+
+/* The canvas is NOT mirrored by CSS (that would flip the text labels).
+   main.js flips the x coordinates itself instead. */
+#overlay {
+  pointer-events: none;
+}
+
+#info {
+  position: fixed;
+  top: 12px;
+  left: 12px;
+  padding: 10px 14px;
+  background: rgba(0, 0, 0, 0.65);
+  color: #fff;
+  font: 14px/1.5 ui-monospace, Menlo, Consolas, monospace;
+  border-radius: 8px;
+}
+
+#info[hidden] {
+  display: none;
+}
+
+/* Centered message used for "Starting…" and for errors */
+#message {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  max-width: min(90vw, 560px);
+  padding: 16px 22px;
+  background: rgba(0, 0, 0, 0.8);
+  color: #fff;
+  font-size: 18px;
+  line-height: 1.4;
+  text-align: center;
+  border-radius: 10px;
+}
+
+#message.error {
+  background: #b00020;
+}
+
+#message[hidden] {
+  display: none;
+}
