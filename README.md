@@ -2,7 +2,7 @@
 
 A whiteboard you draw on with hand gestures, using a webcam and a projector.
 
-**Step 4 (this version): smoothing and clean strokes** on top of the pen gesture. The window is a white
+**Step 5 (this version): pen thickness from hand distance** on top of smoothing, clean strokes and the pen gesture. The window is a white
 whiteboard, a small camera preview with your hand skeleton sits in the
 bottom-right corner, and a cursor follows the midpoint between your thumb and
 index fingertips. Pinch thumb and index together to draw; open them to hover.
@@ -46,6 +46,24 @@ is needed on first load (MediaPipe and the hand model come from a CDN).
   only copies the cache and draws the stroke in progress on top. The full list is
   redrawn only after a window resize.
 - **Glitch protection:** the 150px jump check uses the raw (unsmoothed) cursor.
+- **Thickness from depth:** move your hand closer to the camera for a thicker pen,
+  farther for a thinner one. The depth signal is hand size in pixels (average of
+  wrist–middle knuckle and index knuckle–pinky knuckle), smoothed with an
+  exponential moving average (`SIZE_SMOOTHING`). It is mapped between
+  `HAND_SIZE_FAR` and `HAND_SIZE_NEAR` to 5 levels: 2, 4, 8, 14, 22 px (clamped
+  outside the range, with a little hysteresis so it doesn't flicker on a boundary).
+- The thickness is locked when a stroke starts, so each stroke has one width. It
+  uses the level from `THICKNESS_LOCK_LOOKBACK` (6) frames before the pen turned on,
+  because the pinch itself nudges your hand and can change the level. Set
+  `LIVE_THICKNESS = true` in `main.js` to let it change while drawing. Every stroke
+  stores its widths, so resizing redraws it correctly.
+- The hover ring and the drawing dot are as wide as the current thickness
+  (with a minimum size so they stay visible). The info box shows `Hand size`
+  (raw / smoothed) and `Thickness`.
+
+**Tuning the range:** hold your hand open at the farthest distance you'd
+comfortably draw, read the *smooth* number in `Hand size`, and put it in
+`HAND_SIZE_FAR`. Do the same at the closest distance for `HAND_SIZE_NEAR`.
 - A cursor at the midpoint of your thumb and index tips.
   The active zone (middle 60% of the camera frame) covers the whole board, so
   reaching a zone edge puts the cursor at the matching board edge. The cursor
@@ -75,6 +93,6 @@ instead of a blank page.
 In `main.js`: hand tracking is `createHandTracker()`, `startCamera()`,
 `detectHand()` and the distance helpers; the cursor is `getCursor()` and
 `drawCursor()`; the pen is `updatePen()`; strokes are `updateStroke()`,
-`trimStroke()`, `detectJump()`, `drawStroke()`, `rebuildCache()` and `drawBoard()`; smoothing is `OneEuroFilter` and
+`trimStroke()`, `detectJump()`, `handDepthSize()`, `updateThickness()`, `drawStroke()`, `rebuildCache()` and `drawBoard()`; smoothing is `OneEuroFilter` and
 `smoothCursor()`. The whiteboard (`#board`) and the cursor
 (`#cursor`) are separate canvases so strokes aren't erased when the cursor moves.

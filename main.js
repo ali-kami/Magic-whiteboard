@@ -1,6 +1,7 @@
-// MagicBoard – step 3: draw with the pen gesture (pinch thumb and index).
-// Pipeline: webcam -> MediaPipe HandLandmarker -> cursor + pen state ->
-// strokes on the whiteboard, plus a small camera preview with the skeleton.
+// MagicBoard – step 5: pen thickness from hand distance to the camera.
+// Pipeline: webcam -> MediaPipe HandLandmarker -> cursor + pen state + hand
+// size (depth) -> strokes on the whiteboard, plus a small camera preview with
+// the skeleton.
 
 // ---------------------------------------------------------------------------
 // Config
@@ -13,7 +14,26 @@ const PEN_HOLD_FRAMES = 3; // new state must hold this many frames in a row
 
 // --- Pen look ---
 const PEN_COLOR = "#000";
-const PEN_WIDTH = 4; // px
+
+// --- Pen thickness from hand distance to the camera ---
+// Depth signal = hand size in video pixels (bigger = closer). Watch the "Hand
+// size" line in the info box and set the range to what you see:
+//   HAND_SIZE_FAR  = smoothed size with your hand as far as you'd draw  -> thinnest
+//   HAND_SIZE_NEAR = smoothed size with your hand as close as you'd draw -> thickest
+const HAND_SIZE_FAR = 100; // px
+const HAND_SIZE_NEAR = 260; // px
+const SIZE_SMOOTHING = 0.15; // 0–1; per-frame weight of the new size. Lower = steadier but slower
+const THICKNESS_LEVELS = [2, 4, 8, 14, 22]; // px, thinnest (far) to thickest (near)
+// How far past a level boundary (as a fraction of one level) the hand must go
+// before the level changes. Stops flicker when you sit on a boundary.
+const LEVEL_HYSTERESIS = 0.2;
+// When the pen turns on, lock to the thickness level from this many frames
+// earlier (pinching nudges your hand and would otherwise change the level).
+// Only used when LIVE_THICKNESS is false.
+const THICKNESS_LOCK_LOOKBACK = 6; // frames
+// false: thickness is locked when a stroke starts (whole stroke is one width)
+// true:  thickness keeps following your hand while drawing (width varies)
+const LIVE_THICKNESS = false;
 
 // --- Cursor smoothing (One Euro filter) ---
 // MIN_CUTOFF: lower = smoother when the hand is slow/still (but more lag).
@@ -64,8 +84,10 @@ const HIGHLIGHTS = [
 // whole whiteboard. 0.6 = the middle 60% of the width and of the height.
 const ACTIVE_ZONE = 0.6;
 
-const CURSOR_DIAMETER = 20; // px, hollow ring while hovering
-const PEN_DOT_DIAMETER = 16; // px, solid dot while drawing (slightly smaller)
+// The cursor matches the pen thickness: a hollow ring while hovering, a solid
+// dot while drawing. Minimums keep thin pens visible.
+const RING_MIN_DIAMETER = 12; // px
+const DOT_MIN_DIAMETER = 4; // px
 const CURSOR_COLOR = "#444"; // dark gray
 
 // ---------------------------------------------------------------------------
@@ -89,6 +111,8 @@ const distTMEl = document.getElementById("distTM");
 const cursorPosEl = document.getElementById("cursorPos");
 const modeEl = document.getElementById("mode");
 const smoothingEl = document.getElementById("smoothing");
+const handSizeEl = document.getElementById("handSize");
+const thicknessEl = document.getElementById("thickness");
 
 // ---------------------------------------------------------------------------
 // Messages
@@ -163,6 +187,94 @@ function handSize(landmarks) {
 // Normalized distance between two landmarks (1.0 = one "hand size").
 function normalizedDistance(landmarks, i, j) {
   return pixelDistance(landmarks[i], landmarks[j]) / handSize(landmarks);
+}
+
+// ---------------------------------------------------------------------------
+// Hand depth -> pen thickness
+// ---------------------------------------------------------------------------
+
+const INDEX_KNUCKLE = 5;
+const PINKY_KNUCKLE = 17;
+
+// Hand size in video pixels, used as a depth signal (bigger = closer to the
+// camera). Average of palm length (wrist to middle knuckle) and palm width
+// (index knuckle to pinky knuckle); turning your hand changes one a bit but
+// not the other, so the average is steadier than either alone.
+function handDepthSize(landmarks) {
+  return (
+    (pixelDistance(landmarks[WRIST], landmarks[MIDDLE_KNUCKLE]) +
+      pixelDistance(landmarks[INDEX_KNUCKLE], landmarks[PINKY_KNUCKLE])) /
+    2
+  );
+}
+
+let handSizeRaw = null; // this frame's hand size (px), null = no hand
+let handSizeSmoothed = null; // exponential moving average of it
+
+// Call once per new camera frame.
+function updateHandSize(landmarks) {
+  if (!landmarks) {
+    handSizeRaw = null;
+    handSizeSmoothed = null; // start fresh when the hand comes back
+    return;
+  }
+  handSizeRaw = handDepthSize(landmarks);
+  handSizeSmoothed =
+    handSizeSmoothed === null
+      ? handSizeRaw
+      : handSizeSmoothed + SIZE_SMOOTHING * (handSizeRaw - handSizeSmoothed);
+}
+
+let thicknessLevel = null; // index into THICKNESS_LEVELS, null until a hand is seen
+let thickness = THICKNESS_LEVELS[1]; // current pen thickness in px
+
+// Recent hover levels, one per frame, oldest first (at most
+// THICKNESS_LOCK_LOOKBACK long). Pinching moves your hand a little and can
+// change the level, so when the pen turns on we lock to the level from a few
+// frames earlier, before the pinch began.
+const levelHistory = [];
+let penWasOn = false;
+
+// Map the smoothed hand size to one of the thickness levels.
+// Call once per new camera frame, after updatePen() and updateHandSize().
+function updateThickness() {
+  const penJustTurnedOn = pen.on && !penWasOn;
+  penWasOn = pen.on;
+
+  if (handSizeSmoothed === null) {
+    levelHistory.length = 0; // hand lost: old levels are stale
+    return;
+  }
+
+  // The pen just turned on: lock to the level from THICKNESS_LOCK_LOOKBACK
+  // frames ago (the oldest one in the history)
+  if (penJustTurnedOn && !LIVE_THICKNESS && levelHistory.length > 0) {
+    thicknessLevel = levelHistory[0];
+    thickness = THICKNESS_LEVELS[thicknessLevel];
+    return;
+  }
+
+  // Locked: while a stroke is being drawn the thickness stays as it was
+  // when the stroke started (unless LIVE_THICKNESS is on)
+  if (pen.on && !LIVE_THICKNESS) return;
+
+  const count = THICKNESS_LEVELS.length;
+  const t = clamp((handSizeSmoothed - HAND_SIZE_FAR) / (HAND_SIZE_NEAR - HAND_SIZE_FAR), 0, 1);
+  const position = t * count; // 0 .. count; each level is 1 wide
+
+  // Snap to a level, and only move off the current one once we're clearly
+  // past its edge
+  if (
+    thicknessLevel === null ||
+    position >= thicknessLevel + 1 + LEVEL_HYSTERESIS ||
+    position < thicknessLevel - LEVEL_HYSTERESIS
+  ) {
+    thicknessLevel = Math.min(Math.floor(position), count - 1);
+  }
+  thickness = THICKNESS_LEVELS[thicknessLevel];
+
+  levelHistory.push(thicknessLevel);
+  if (levelHistory.length > THICKNESS_LOCK_LOOKBACK) levelHistory.shift();
 }
 
 // ---------------------------------------------------------------------------
@@ -280,26 +392,27 @@ function detectJump(rawCursor) {
 }
 
 // Draw the cursor on its own layer. Pass null to just clear it.
-//   hovering: hollow dark gray ring
-//   drawing:  solid dot in the pen color, slightly smaller
-function drawCursor(cursor, penOn) {
+//   hovering: hollow dark gray ring, as wide as the pen thickness
+//   drawing:  solid dot in the pen color, as wide as the stroke thickness
+function drawCursor(cursor, penOn, penThickness) {
   cursorCtx.clearRect(0, 0, cursorCanvas.clientWidth, cursorCanvas.clientHeight);
   if (!cursor) return;
 
   if (penOn) {
     cursorCtx.fillStyle = PEN_COLOR;
     cursorCtx.beginPath();
-    cursorCtx.arc(cursor.x, cursor.y, PEN_DOT_DIAMETER / 2, 0, Math.PI * 2);
+    cursorCtx.arc(cursor.x, cursor.y, Math.max(penThickness, DOT_MIN_DIAMETER) / 2, 0, Math.PI * 2);
     cursorCtx.fill();
     return;
   }
 
   const lineWidth = 2;
+  const diameter = Math.max(penThickness, RING_MIN_DIAMETER);
   cursorCtx.strokeStyle = CURSOR_COLOR;
   cursorCtx.lineWidth = lineWidth;
   cursorCtx.beginPath();
-  // Subtract half the line width so the outer edge is exactly CURSOR_DIAMETER
-  cursorCtx.arc(cursor.x, cursor.y, CURSOR_DIAMETER / 2 - lineWidth / 2, 0, Math.PI * 2);
+  // Subtract half the line width so the outer edge is exactly `diameter`
+  cursorCtx.arc(cursor.x, cursor.y, diameter / 2 - lineWidth / 2, 0, Math.PI * 2);
   cursorCtx.stroke();
 }
 
@@ -341,7 +454,11 @@ function updatePen(landmarks) {
 // Strokes and the whiteboard
 // ---------------------------------------------------------------------------
 
-// A stroke is an array of points: [{ x, y }, ...] in board pixels.
+// A stroke is { live, points }, where points is [{ x, y, w }, ...]: board
+// pixels plus the line width at that point. Every stroke stores its own
+// widths, so redrawing (cache rebuild after a resize) always looks the same.
+//   live false: all points share one width (locked at stroke start)
+//   live true:  each segment uses the width of its end point
 const strokes = []; // finished strokes
 let currentStroke = null; // the stroke being drawn right now, or null
 let boardDirty = true; // true when the board needs to be redrawn
@@ -353,10 +470,10 @@ let boardDirty = true; // true when the board needs to be redrawn
 const cache = document.createElement("canvas");
 const cacheCtx = cache.getContext("2d");
 
-// Pen look; set before drawing strokes (resizing a canvas resets its settings)
+// Pen look; set before drawing strokes (resizing a canvas resets its settings).
+// Line width is set per stroke in drawStroke().
 function applyPenStyle(ctx) {
   ctx.strokeStyle = PEN_COLOR;
-  ctx.lineWidth = PEN_WIDTH;
   ctx.lineCap = "round";
   ctx.lineJoin = "round";
 }
@@ -371,8 +488,12 @@ function rebuildCache() {
   for (const stroke of strokes) drawStroke(cacheCtx, stroke);
 }
 
+// Start a new stroke at the cursor, using the current pen thickness
 function startStroke(cursor) {
-  currentStroke = [{ x: cursor.x, y: cursor.y }];
+  currentStroke = {
+    live: LIVE_THICKNESS,
+    points: [{ x: cursor.x, y: cursor.y, w: thickness }],
+  };
   boardDirty = true;
 }
 
@@ -380,10 +501,11 @@ function startStroke(cursor) {
 // If fewer than 2 points would be left, the stroke was a tap or a tiny mark,
 // so keep it as a single dot (at its middle point) instead of losing it.
 function trimStroke(stroke) {
-  if (stroke.length - 2 * TRIM_POINTS >= 2) {
-    return stroke.slice(TRIM_POINTS, stroke.length - TRIM_POINTS);
+  const pts = stroke.points;
+  if (pts.length - 2 * TRIM_POINTS >= 2) {
+    return { ...stroke, points: pts.slice(TRIM_POINTS, pts.length - TRIM_POINTS) };
   }
-  return [stroke[Math.floor(stroke.length / 2)]];
+  return { ...stroke, points: [pts[Math.floor(pts.length / 2)]] };
 }
 
 // While a stroke is in progress all its points are drawn; trimming only
@@ -420,7 +542,9 @@ function updateStroke(cursor, jumped) {
   if (!currentStroke) {
     startStroke(cursor);
   } else {
-    currentStroke.push({ x: cursor.x, y: cursor.y });
+    // `thickness` is frozen while drawing unless LIVE_THICKNESS is on, so
+    // this is the locked width in the normal case
+    currentStroke.points.push({ x: cursor.x, y: cursor.y, w: thickness });
     boardDirty = true;
   }
 }
@@ -429,23 +553,52 @@ function updateStroke(cursor, jumped) {
 // quadratic curve that ends at the midpoint to the next point, which rounds
 // off the corners between samples.
 function drawStroke(ctx, stroke) {
-  if (stroke.length === 1) {
+  const pts = stroke.points;
+
+  if (pts.length === 1) {
     // A single tap: just a dot
     ctx.fillStyle = PEN_COLOR;
     ctx.beginPath();
-    ctx.arc(stroke[0].x, stroke[0].y, PEN_WIDTH / 2, 0, Math.PI * 2);
+    ctx.arc(pts[0].x, pts[0].y, pts[0].w / 2, 0, Math.PI * 2);
     ctx.fill();
     return;
   }
 
-  ctx.beginPath();
-  ctx.moveTo(stroke[0].x, stroke[0].y);
-  for (let i = 1; i < stroke.length - 1; i++) {
-    const midX = (stroke[i].x + stroke[i + 1].x) / 2;
-    const midY = (stroke[i].y + stroke[i + 1].y) / 2;
-    ctx.quadraticCurveTo(stroke[i].x, stroke[i].y, midX, midY);
+  const end = pts[pts.length - 1];
+
+  if (!stroke.live) {
+    // One width for the whole stroke: trace it as a single path
+    ctx.lineWidth = pts[0].w;
+    ctx.beginPath();
+    ctx.moveTo(pts[0].x, pts[0].y);
+    for (let i = 1; i < pts.length - 1; i++) {
+      const midX = (pts[i].x + pts[i + 1].x) / 2;
+      const midY = (pts[i].y + pts[i + 1].y) / 2;
+      ctx.quadraticCurveTo(pts[i].x, pts[i].y, midX, midY);
+    }
+    ctx.lineTo(end.x, end.y);
+    ctx.stroke();
+    return;
   }
-  const end = stroke[stroke.length - 1];
+
+  // Width changes along the stroke: draw it one curve segment at a time,
+  // each with its own width (round caps hide the joins between segments)
+  let startX = pts[0].x;
+  let startY = pts[0].y;
+  for (let i = 1; i < pts.length - 1; i++) {
+    const midX = (pts[i].x + pts[i + 1].x) / 2;
+    const midY = (pts[i].y + pts[i + 1].y) / 2;
+    ctx.lineWidth = pts[i].w;
+    ctx.beginPath();
+    ctx.moveTo(startX, startY);
+    ctx.quadraticCurveTo(pts[i].x, pts[i].y, midX, midY);
+    ctx.stroke();
+    startX = midX;
+    startY = midY;
+  }
+  ctx.lineWidth = end.w;
+  ctx.beginPath();
+  ctx.moveTo(startX, startY);
   ctx.lineTo(end.x, end.y);
   ctx.stroke();
 }
@@ -572,13 +725,17 @@ function updateInfoBox(fps, landmarks, cursor) {
     distTMEl.textContent = normalizedDistance(landmarks, THUMB_TIP, MIDDLE_TIP).toFixed(2);
     cursorPosEl.textContent = `${Math.round(cursor.x)}, ${Math.round(cursor.y)}`;
     modeEl.textContent = pen.on ? "PEN" : "HOVER";
+    // raw / smoothed, to help set HAND_SIZE_FAR and HAND_SIZE_NEAR
+    handSizeEl.textContent = `${Math.round(handSizeRaw)} / ${Math.round(handSizeSmoothed)}`;
   } else {
     handEl.textContent = "no";
     distTIEl.textContent = "–";
     distTMEl.textContent = "–";
     cursorPosEl.textContent = "–";
     modeEl.textContent = "–";
+    handSizeEl.textContent = "–";
   }
+  thicknessEl.textContent = `${thickness}px`;
 }
 
 // ---------------------------------------------------------------------------
@@ -608,6 +765,8 @@ function startLoop(handTracker) {
       if (jumped) resetCursorFilters(); // new position, no sliding from the old one
       cursor = smoothCursor(rawCursor, now);
       updatePen(landmarks);
+      updateHandSize(landmarks);
+      updateThickness(); // after updatePen: it is locked while a stroke is drawn
       updateStroke(cursor, jumped);
       frameCount++;
     }
@@ -620,7 +779,7 @@ function startLoop(handTracker) {
     }
 
     drawBoard();
-    drawCursor(cursor, pen.on);
+    drawCursor(cursor, pen.on, thickness);
     if (!preview.classList.contains("hidden")) drawPreviewOverlay(landmarks);
     updateInfoBox(fps, landmarks, cursor);
 
