@@ -1,4 +1,4 @@
-// MagicBoard – step 7: highlighter gesture (on top of presentation mode).
+// MagicBoard – step 8: steadier writing (stabilizer, bigger active zone).
 // Pipeline: webcam -> MediaPipe HandLandmarker -> cursor + gesture mode + hand
 // size (depth) -> strokes on the whiteboard, plus a small camera preview with
 // the skeleton. Keys: c h b z x s f (see the cheat sheet in the info box).
@@ -60,9 +60,26 @@ const LIVE_THICKNESS = false;
 // MIN_CUTOFF: lower = smoother when the hand is slow/still (but more lag).
 // BETA: higher = less lag when the hand moves fast (but more jitter).
 // D_CUTOFF: smoothing of the speed estimate; rarely needs changing.
-const MIN_CUTOFF = 1.0;
-const BETA = 0.007;
+const MIN_CUTOFF = 0.5;
+const BETA = 0.003;
 const D_CUTOFF = 1.0;
+
+// --- Stabilizer ("lazy brush"), toggle with 'v' ---
+// The point that actually draws is tied to the cursor by an invisible string
+// this long (px). It only moves when the cursor pulls the string tight, so
+// shakes smaller than this are ignored. Bigger = steadier but more lag, and
+// the line trails the cursor by up to this much.
+const STABILIZER_RADIUS = 12;
+const STABILIZER_COLOR = "#ff5252"; // the drawing point and string, shown while drawing
+
+// --- Webcam resolution to request (the browser may give something else) ---
+const CAMERA_WIDTH = 1280;
+const CAMERA_HEIGHT = 720;
+
+// --- Stroke cleanup ---
+// Moving-average passes over a finished stroke's points (3 points wide).
+// 0 = off; more passes = smoother but rounder corners.
+const CLEANUP_PASSES = 1;
 
 // Points trimmed from the start AND the end of every finished stroke, to
 // remove the tails caused by the pinch/release moving the cursor.
@@ -102,8 +119,10 @@ const HIGHLIGHTS = [
 ];
 
 // The "active zone": the centered part of the camera frame that maps to the
-// whole whiteboard. 0.6 = the middle 60% of the width and of the height.
-const ACTIVE_ZONE = 0.6;
+// whole whiteboard. 0.8 = the middle 80% of the width and of the height.
+// Bigger = easier to reach the edges, but each hand movement covers more board
+// (less precise). Smaller = the opposite.
+const ACTIVE_ZONE = 0.8;
 
 // The cursor matches the pen thickness: a hollow ring while hovering, a solid
 // dot while drawing. Minimums keep thin pens visible.
@@ -131,6 +150,8 @@ const distTMEl = document.getElementById("distTM");
 const cursorPosEl = document.getElementById("cursorPos");
 const modeEl = document.getElementById("mode");
 const smoothingEl = document.getElementById("smoothing");
+const stabilizerEl = document.getElementById("stabilizer");
+const cameraEl = document.getElementById("camera");
 const handSizeEl = document.getElementById("handSize");
 const thicknessEl = document.getElementById("thickness");
 
@@ -170,11 +191,16 @@ async function createHandTracker() {
 // Ask the browser for the webcam and start the video element.
 async function startCamera() {
   const stream = await navigator.mediaDevices.getUserMedia({
-    video: { width: { ideal: 1280 }, height: { ideal: 720 } },
+    video: { width: { ideal: CAMERA_WIDTH }, height: { ideal: CAMERA_HEIGHT } },
     audio: false,
   });
   video.srcObject = stream;
   await video.play();
+
+  // Show the resolution we actually got (the camera may not support the one we asked for)
+  const got = `${video.videoWidth}x${video.videoHeight}`;
+  const asked = `${CAMERA_WIDTH}x${CAMERA_HEIGHT}`;
+  cameraEl.textContent = got === asked ? got : `${got} (asked ${asked})`;
 
   // Make the preview box the same shape as the webcam image
   preview.style.aspectRatio = `${video.videoWidth} / ${video.videoHeight}`;
@@ -315,7 +341,7 @@ function getCursor(landmarks) {
   const midX = (landmarks[THUMB_TIP].x + landmarks[INDEX_TIP].x) / 2;
   const midY = (landmarks[THUMB_TIP].y + landmarks[INDEX_TIP].y) / 2;
 
-  const zoneStart = (1 - ACTIVE_ZONE) / 2; // 0.2
+  const zoneStart = (1 - ACTIVE_ZONE) / 2; // 0.1 for an 80% zone
   const u = (1 - midX - zoneStart) / ACTIVE_ZONE; // 0 = left edge of zone, 1 = right
   const v = (midY - zoneStart) / ACTIVE_ZONE; // 0 = top edge of zone, 1 = bottom
 
@@ -415,11 +441,25 @@ function detectJump(rawCursor) {
 //   hovering:  hollow ring, as wide as the pen thickness (at least CURSOR_MIN_SIZE)
 //   pen:       solid dot in the ink color, as wide as the stroke
 //   highlight: solid yellow dot, as wide as the (3x) highlighter stroke
-function drawCursor(cursor, mode, penThickness) {
+// While drawing with the stabilizer on, drawingPoint ({x, y}) is shown as a
+// small dot joined to the cursor by a faint line.
+function drawCursor(cursor, mode, penThickness, drawingPoint) {
   cursorCtx.clearRect(0, 0, cursorCanvas.clientWidth, cursorCanvas.clientHeight);
   if (!cursor) return;
 
   if (mode !== MODE_HOVER) {
+    // Stabilizer: the string from the cursor to the point that is drawing
+    if (drawingPoint) {
+      cursorCtx.strokeStyle = STABILIZER_COLOR;
+      cursorCtx.globalAlpha = 0.5;
+      cursorCtx.lineWidth = 1.5;
+      cursorCtx.beginPath();
+      cursorCtx.moveTo(cursor.x, cursor.y);
+      cursorCtx.lineTo(drawingPoint.x, drawingPoint.y);
+      cursorCtx.stroke();
+      cursorCtx.globalAlpha = 1;
+    }
+
     const highlight = mode === MODE_HIGHLIGHT;
     const width = penThickness * (highlight ? HIGHLIGHT_WIDTH_FACTOR : 1);
     cursorCtx.fillStyle = highlight ? HIGHLIGHT_COLOR : currentTheme().ink;
@@ -428,6 +468,14 @@ function drawCursor(cursor, mode, penThickness) {
     cursorCtx.arc(cursor.x, cursor.y, Math.max(width, DOT_MIN_DIAMETER) / 2, 0, Math.PI * 2);
     cursorCtx.fill();
     cursorCtx.globalAlpha = 1;
+
+    // Small dot where the line is actually being drawn
+    if (drawingPoint) {
+      cursorCtx.fillStyle = STABILIZER_COLOR;
+      cursorCtx.beginPath();
+      cursorCtx.arc(drawingPoint.x, drawingPoint.y, 3, 0, Math.PI * 2);
+      cursorCtx.fill();
+    }
     return;
   }
 
@@ -509,6 +557,40 @@ function updateMode(landmarks) {
     gesture.candidate = null;
     gesture.candidateFrames = 0;
   }
+}
+
+// ---------------------------------------------------------------------------
+// Stabilizer ("lazy brush")
+// ---------------------------------------------------------------------------
+
+let stabilizerOn = true; // toggled with the 'v' key
+let drawingPoint = null; // where the line is being drawn; null when not drawing
+
+// Returns the point the stroke should use this frame, given the cursor.
+// With the stabilizer on, the drawing point is tied to the cursor by a string
+// of STABILIZER_RADIUS. If the cursor is closer than that, the drawing point
+// stays put. If it is farther, the string pulls tight and drags the drawing
+// point along, so it ends up exactly STABILIZER_RADIUS from the cursor, on the
+// line between them. The first call of a stroke starts it at the cursor.
+function strokePoint(cursor) {
+  if (!stabilizerOn) {
+    drawingPoint = null;
+    return cursor;
+  }
+  if (!drawingPoint) {
+    drawingPoint = { x: cursor.x, y: cursor.y };
+    return drawingPoint;
+  }
+
+  const dx = cursor.x - drawingPoint.x;
+  const dy = cursor.y - drawingPoint.y;
+  const distance = Math.hypot(dx, dy);
+  if (distance > STABILIZER_RADIUS) {
+    const pull = (distance - STABILIZER_RADIUS) / distance;
+    drawingPoint.x += dx * pull;
+    drawingPoint.y += dy * pull;
+  }
+  return drawingPoint;
 }
 
 // ---------------------------------------------------------------------------
@@ -596,8 +678,24 @@ function trimStroke(stroke) {
   return { ...stroke, points: [pts[Math.floor(pts.length / 2)]] };
 }
 
-// While a stroke is in progress all its points are drawn; trimming only
-// happens here, when it is finished.
+// Light cleanup of a finished stroke: each point (except the first and last,
+// which stay put) becomes the average of itself and its two neighbors. Widths
+// are left alone. Needs at least 3 points.
+function smoothStroke(stroke) {
+  let pts = stroke.points;
+  for (let pass = 0; pass < CLEANUP_PASSES && pts.length >= 3; pass++) {
+    pts = pts.map((p, i) => {
+      if (i === 0 || i === pts.length - 1) return p;
+      const a = pts[i - 1];
+      const b = pts[i + 1];
+      return { x: (a.x + p.x + b.x) / 3, y: (a.y + p.y + b.y) / 3, w: p.w };
+    });
+  }
+  return { ...stroke, points: pts };
+}
+
+// While a stroke is in progress all its points are drawn; trimming and
+// smoothing only happen here, when it is finished.
 //
 // discardIfShort: the stroke is ending because of a direct PEN <-> HIGHLIGHT
 // switch. A short stroke there is just the mark made while the fingers settle,
@@ -608,11 +706,12 @@ function endStroke(discardIfShort = false) {
 
   const tooShort = currentStroke.points.length < SHORT_STROKE_POINTS;
   if (!(tooShort && (discardIfShort || currentStroke.afterSwitch))) {
-    const finished = trimStroke(currentStroke);
+    const finished = smoothStroke(trimStroke(currentStroke));
     strokes.push(finished);
     drawStroke(cacheCtx, finished); // add it to the cache, once
   }
   currentStroke = null;
+  drawingPoint = null; // the next stroke starts fresh at the cursor
   boardDirty = true;
 }
 
@@ -620,6 +719,7 @@ function clearBoard() {
   strokes.length = 0;
   cacheCtx.clearRect(0, 0, cache.width, cache.height); // (overshoots because of the dpr transform; harmless)
   currentStroke = null; // if the pen is still on, a new stroke starts next frame
+  drawingPoint = null;
   boardDirty = true;
 }
 
@@ -653,12 +753,15 @@ function updateStroke(cursor, jumped) {
     afterSwitch = true;
   }
 
+  // Strokes use the stabilized drawing point, not the raw cursor
+  const point = strokePoint(cursor);
+
   if (!currentStroke) {
-    startStroke(cursor, tool, afterSwitch);
+    startStroke(point, tool, afterSwitch);
   } else {
     // `thickness` is frozen while drawing unless LIVE_THICKNESS is on, so
     // this is the locked width in the normal case
-    currentStroke.points.push({ x: cursor.x, y: cursor.y, w: strokeWidth(tool) });
+    currentStroke.points.push({ x: point.x, y: point.y, w: strokeWidth(tool) });
     boardDirty = true;
   }
 }
@@ -909,7 +1012,7 @@ function startLoop(handTracker) {
     }
 
     drawBoard();
-    drawCursor(cursor, gesture.mode, thickness);
+    drawCursor(cursor, gesture.mode, thickness, drawingPoint);
     if (previewVisible()) drawPreviewOverlay(landmarks);
     updateInfoBox(fps, landmarks, cursor);
 
@@ -926,6 +1029,12 @@ function toggleSmoothing() {
   smoothingOn = !smoothingOn;
   resetCursorFilters(); // start fresh so there's no jump when switching
   smoothingEl.textContent = smoothingOn ? "on" : "off";
+}
+
+function toggleStabilizer() {
+  stabilizerOn = !stabilizerOn;
+  drawingPoint = null; // restart from the cursor so there's no jump when switching
+  stabilizerEl.textContent = stabilizerOn ? "on" : "off";
 }
 
 function toggleFullscreen() {
@@ -961,6 +1070,7 @@ async function main() {
       case "z": undoStroke(); break;
       case "x": clearBoard(); break;
       case "s": toggleSmoothing(); break;
+      case "v": toggleStabilizer(); break;
       case "f": toggleFullscreen(); break;
     }
   });

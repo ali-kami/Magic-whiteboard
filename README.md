@@ -2,7 +2,7 @@
 
 A whiteboard you draw on with hand gestures, using a webcam and a projector.
 
-**Step 7 (this version): highlighter gesture** on top of presentation mode, pen thickness, smoothing, clean strokes and the pen gesture. The window is a white
+**Step 8 (this version): steadier writing** on top of the highlighter gesture, presentation mode, pen thickness, smoothing, clean strokes and the pen gesture. The window is a white
 whiteboard, a small camera preview with your hand skeleton sits in the
 bottom-right corner, and a cursor follows the midpoint between your thumb and
 index fingertips. Pinch thumb and index together to draw; open them to hover.
@@ -82,6 +82,22 @@ comfortably draw, read the *smooth* number in `Hand size`, and put it in
   without a color, so `b` recolors everything already drawn. The info box ends with
   a key cheat sheet. `CURSOR_MIN_SIZE` (top of `main.js`) sets the smallest hover
   ring, so raise it if the cursor is hard to see on the wall.
+- **Steadier writing:**
+  - **Stabilizer ("lazy brush"):** strokes use a drawing point tied to the cursor by an
+    invisible string of `STABILIZER_RADIUS` (12px). It only moves when the cursor
+    pulls the string tight, so small shakes are ignored. While drawing you see it as a
+    small red dot joined to the cursor by a faint line. `v` toggles it.
+  - **Active zone** is now 80% of the camera frame (`ACTIVE_ZONE`).
+  - **Smoothing defaults:** `MIN_CUTOFF = 0.5`, `BETA = 0.003`.
+  - **Stroke cleanup:** a finished stroke gets a 3-point moving average
+    (`CLEANUP_PASSES`) after trimming.
+  - **Camera:** 1280x720 is requested (`CAMERA_WIDTH` / `CAMERA_HEIGHT`); the info
+    box shows the resolution you actually got.
+
+**Still shaky?** Raise `STABILIZER_RADIUS` (e.g. 20), lower `MIN_CUTOFF` (e.g. 0.3),
+raise `CLEANUP_PASSES` to 2, or lower `ACTIVE_ZONE` (e.g. 0.7).
+**Too laggy?** Do the opposite: lower `STABILIZER_RADIUS` (e.g. 6), raise `MIN_CUTOFF`
+(e.g. 0.8) or `BETA` (e.g. 0.01), set `CLEANUP_PASSES` to 0.
 - A cursor at the midpoint of your thumb and index tips.
   The active zone (middle 60% of the camera frame) covers the whole board, so
   reaching a zone edge puts the cursor at the matching board edge. The cursor
@@ -100,6 +116,7 @@ comfortably draw, read the *smooth* number in `Hand size`, and put it in
 | `f` | Toggle fullscreen |
 | `x` | Clear the board |
 | `s` | Turn cursor smoothing on / off (shown in the info box) |
+| `v` | Turn the stabilizer on / off (shown in the info box) |
 
 If the camera is denied or MediaPipe can't load, a red error message appears
 instead of a blank page.
@@ -115,6 +132,6 @@ instead of a blank page.
 In `main.js`: hand tracking is `createHandTracker()`, `startCamera()`,
 `detectHand()` and the distance helpers; the cursor is `getCursor()` and
 `drawCursor()`; the gesture mode is `updateMode()`; strokes are `updateStroke()`,
-`trimStroke()`, `detectJump()`, `handDepthSize()`, `updateThickness()`, `drawStroke()`, `rebuildCache()` and `drawBoard()`; smoothing is `OneEuroFilter` and
+`trimStroke()`, `detectJump()`, `strokePoint()`, `smoothStroke()`, `handDepthSize()`, `updateThickness()`, `drawStroke()`, `rebuildCache()` and `drawBoard()`; smoothing is `OneEuroFilter` and
 `smoothCursor()`. The whiteboard (`#board`) and the cursor
 (`#cursor`) are separate canvases so strokes aren't erased when the cursor moves.
